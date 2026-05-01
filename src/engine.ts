@@ -60,6 +60,7 @@ export interface RunEngineOptions {
   instruction: string;
   planMode?: boolean;
   profile: ExecutionProfile;
+  profileSettings?: ModelProfileSettings;
 }
 
 export interface EngineResult {
@@ -125,8 +126,7 @@ export interface ReplTurnOptions {
   conversationMessages: ChatMessage[];
   cwd: string;
   instruction: string;
-  profile: ExecutionProfile;
-  profileSettings?: ModelProfileSettings;
+  profileSettings: ModelProfileSettings;
 }
 
 export interface ReplTurnResult {
@@ -181,7 +181,7 @@ export async function runEngine(
 
   const executeScanProject = dependencies.scanProject ?? scanProject;
   const executeBuildContext = dependencies.buildContext ?? buildContext;
-  const profile = resolveModelProfile(options.profile);
+  const profile = resolveRunProfile(options);
   const projectPrompt = loadProjectPrompt(options.cwd);
   const scanResult = await executeScanProject({
     rootDir: options.cwd,
@@ -283,7 +283,7 @@ export async function prepareExecution(
     (await (dependencies.inspectRepository ?? inspectRepository)(options.cwd));
   const executeSearchWeb = dependencies.searchWeb ?? searchWeb;
   const searchOptions = buildSearchOptions(config);
-  const profile = initialState?.profile ?? resolveModelProfile(options.profile);
+  const profile = initialState?.profile ?? resolveRunProfile(options);
   const searchResults =
     initialState?.searchResults ??
     (hasWebSearchTrigger(options.instruction)
@@ -574,7 +574,7 @@ export async function executeReplTurn(
   ensureNotAborted(dependencies.abortSignal);
   const config = loadConfig({ cwd: options.cwd });
   const hasApiKey = Boolean(config.apiKey);
-  const profile = options.profileSettings ?? resolveModelProfile(options.profile);
+  const profile = options.profileSettings;
   const instruction = stripWebSearchTrigger(options.instruction);
   const inspectRepo = dependencies.inspectRepository ?? inspectRepository;
   const repositoryState = await inspectRepo(options.cwd);
@@ -876,7 +876,7 @@ export async function generatePlan(
   const historySummary = buildSessionHistorySummary(loadContextStore(options.cwd));
   const executeScanProject = dependencies.scanProject ?? scanProject;
   const executeBuildContext = dependencies.buildContext ?? buildContext;
-  const profile = resolveModelProfile(options.profile);
+  const profile = resolveRunProfile(options);
   const scanResult = await executeScanProject({
     rootDir: options.cwd,
     instruction,
@@ -961,7 +961,8 @@ export async function executePlanSteps(
       cwd: options.cwd,
       dryRun: false,
       instruction: stepInstruction,
-      profile: options.profile
+      profile: options.profile,
+      profileSettings: options.profileSettings
     };
 
     try {
@@ -1116,8 +1117,15 @@ function buildRepairPrompt(code: string, message: string): string {
 
 function requireGitRepository(repositoryState: RepositoryState): void {
   if (!repositoryState.isRepository) {
-    throw new EngineError("GIT_REQUIRED", "DeepVibe requires a Git repository for non-dry-run execution.");
+    throw new EngineError(
+      "GIT_REQUIRED",
+      "DeepVibe requires a Git repository for non-dry-run execution. Run `git init`, pass `--init`, or use `deepvibe chat` for the interactive setup flow."
+    );
   }
+}
+
+function resolveRunProfile(options: Pick<RunEngineOptions, "profile" | "profileSettings">): ModelProfileSettings {
+  return options.profileSettings ?? resolveModelProfile(options.profile);
 }
 
 function summarizeAppliedFiles(applied: AppliedFileChange[]): string {
@@ -1149,7 +1157,7 @@ function buildSearchOptions(config: { searchProvider?: string; tavilyApiKey?: st
   return { provider: provider as SearchWebOptions["provider"], searchApiKey };
 }
 
-function addUsage(current: DeepSeekUsage | null, next: DeepSeekUsage | null): DeepSeekUsage | null {
+export function addUsage(current: DeepSeekUsage | null, next: DeepSeekUsage | null): DeepSeekUsage | null {
   if (!current && !next) {
     return null;
   }
@@ -1164,10 +1172,11 @@ function addUsage(current: DeepSeekUsage | null, next: DeepSeekUsage | null): De
   };
 }
 
-function sumUsageField(left?: number, right?: number): number | undefined {
+export function sumUsageField(left?: number, right?: number): number | undefined {
   if (left === undefined && right === undefined) {
     return undefined;
   }
 
   return (left ?? 0) + (right ?? 0);
 }
+

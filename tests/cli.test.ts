@@ -156,6 +156,33 @@ describe("runCli", () => {
     );
   });
 
+  it("passes explicit model and effect selections through to the chat REPL", async () => {
+    const cwd = createCliWorkspace({});
+    const homeDir = path.join(cwd, "home");
+    writeGlobalConfig(homeDir, { apiKey: "test-key" });
+    const startRepl = vi.fn().mockResolvedValue(undefined);
+
+    await runCli(["node", "deepvibe", "chat", "--model", "flash", "--effect", "xhigh"], {
+      cwd: () => cwd,
+      homeDir,
+      startRepl,
+      stderr: createWritableStream(false),
+      stdin: createInputStream("", false),
+      stdout: createWritableStream(false)
+    });
+
+    expect(startRepl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profile: "default",
+        profileSelection: {
+          model: "deepseek-v4-flash",
+          effect: "xhigh"
+        }
+      }),
+      expect.any(Object)
+    );
+  });
+
   it("applies immediately when --force is provided", async () => {
     const cwd = createCliWorkspace({});
     const homeDir = path.join(cwd, "home");
@@ -177,6 +204,70 @@ describe("runCli", () => {
 
     expect(applyPreparedExecution).toHaveBeenCalledTimes(1);
     expect(stdout.readAsString()).toContain("Applied with force");
+  });
+
+  it("passes explicit model and effect settings to one-shot execution", async () => {
+    const cwd = createCliWorkspace({});
+    const homeDir = path.join(cwd, "home");
+    writeGlobalConfig(homeDir, { apiKey: "test-key" });
+    const prepareExecution = vi.fn().mockResolvedValue(createPreparedExecution());
+
+    await runCli(["node", "deepvibe", "--force", "--model", "flash", "--effect", "xhigh", "update api"], {
+      applyPreparedExecution: vi.fn().mockResolvedValue({ message: "Applied" }),
+      cwd: () => cwd,
+      homeDir,
+      prepareExecution,
+      stderr: createWritableStream(false),
+      stdin: createInputStream("", false),
+      stdout: createWritableStream(false)
+    });
+
+    expect(prepareExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profile: "default",
+        profileSettings: expect.objectContaining({
+          model: "deepseek-v4-flash",
+          reasoningEffort: "max"
+        })
+      }),
+      expect.any(Object)
+    );
+  });
+
+  it("initializes a Git repository before one-shot execution when --init is provided", async () => {
+    const cwd = createCliWorkspace({});
+    const homeDir = path.join(cwd, "home");
+    writeGlobalConfig(homeDir, { apiKey: "test-key" });
+    const initializeRepository = vi.fn().mockResolvedValue({
+      isRepository: true,
+      isDirty: false,
+      currentHead: null
+    });
+    const stdout = createWritableStream(false);
+
+    await runCli(["node", "deepvibe", "--force", "--init", "build project"], {
+      applyPreparedExecution: vi.fn().mockResolvedValue({ message: "Applied" }),
+      cwd: () => cwd,
+      homeDir,
+      initializeRepository,
+      prepareWorkspaceAccess: vi.fn().mockResolvedValue({
+        requestedCwd: cwd,
+        effectiveCwd: cwd,
+        mode: "full"
+      }),
+      inspectRepository: vi.fn().mockResolvedValue({
+        isRepository: false,
+        isDirty: false,
+        currentHead: null
+      }),
+      prepareExecution: vi.fn().mockResolvedValue(createPreparedExecution()),
+      stderr: createWritableStream(false),
+      stdin: createInputStream("", false),
+      stdout
+    });
+
+    expect(initializeRepository).toHaveBeenCalledWith(cwd);
+    expect(stdout.readAsString()).toContain("Git repository initialized.");
   });
 
   it("supports review before accepting an execution plan", async () => {

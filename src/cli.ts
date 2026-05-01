@@ -1,7 +1,21 @@
-import { createInterface } from "node:readline/promises";
+﻿import { createInterface } from "node:readline/promises";
 
 import { Command } from "commander";
 
+import {
+  confirmCommandExecution,
+  confirmLandingPreparedExecution,
+  confirmPlan,
+  confirmPlanStep,
+  confirmPreparedExecution,
+  ensureInteractiveConfirmationAvailable,
+  formatLandingExecutionSummary,
+  formatPlan,
+  formatPlanResults,
+  formatPreparedExecutionDiffs,
+  formatPreparedExecutionSummary,
+  reviewPreparedExecutionFiles
+} from "./cli-confirmation.js";
 import {
   isCommandPersistentlyApproved,
   loadCommandApprovalStore,
@@ -9,9 +23,22 @@ import {
   type CommandApprovalStore
 } from "./command-approval-store.js";
 import { loadConfig, setConfigValue } from "./config.js";
-import { applyPreparedExecution, executePlanSteps, generatePlan, prepareExecution, runEngine, type PreparedExecution, type RunEngineDependencies, type PlanStepResult } from "./engine.js";
+import { applyPreparedExecution, executePlanSteps, generatePlan, prepareExecution, runEngine, type ExecutionProfile, type PreparedExecution, type RunEngineDependencies, type PlanStepResult } from "./engine.js";
 import type { Language } from "./i18n.js";
-import { createAiCommit, inspectRepository, recordOperation, undoLastAiChange } from "./project/git-manager.js";
+import {
+  createAiCommit,
+  initializeRepository,
+  inspectRepository,
+  recordOperation,
+  undoLastAiChange
+} from "./project/git-manager.js";
+import {
+  resolveReplModelProfile,
+  resolveReplProfileSelection,
+  type ReplModelFamily,
+  type ReplProfileSelection,
+  type ReplReasoningEffect
+} from "./model-profile.js";
 import { startRepl } from "./repl.js";
 import { startService } from "./server.js";
 import { createDockerSandboxCommandRunner, type CommandApprovalRequest } from "./tools.js";
@@ -40,6 +67,7 @@ export interface CliDependencies extends RunEngineDependencies {
   generatePlan?: typeof generatePlan;
   homeDir?: string;
   prepareExecution?: typeof prepareExecution;
+  initializeRepository?: typeof initializeRepository;
   runEngine?: typeof runEngine;
   setConfigValue?: typeof setConfigValue;
   startRepl?: typeof startRepl;
@@ -51,12 +79,26 @@ export interface CliDependencies extends RunEngineDependencies {
   undoLastAiChange?: typeof undoLastAiChange;
 }
 
+export {
+  confirmCommandExecution,
+  confirmLandingPreparedExecution,
+  confirmPlanStep,
+  confirmPreparedExecution,
+  formatLandingExecutionSummary,
+  formatPlan,
+  formatPlanResults,
+  formatPreparedExecutionDiffs,
+  formatPreparedExecutionSummary,
+  reviewPreparedExecutionFiles
+} from "./cli-confirmation.js";
+
 export async function runCli(argv: string[], dependencies: CliDependencies = {}): Promise<void> {
   const executeRunEngine = dependencies.runEngine ?? runEngine;
   const executeGeneratePlan = dependencies.generatePlan ?? generatePlan;
   const executePrepare = dependencies.prepareExecution ?? prepareExecution;
   const executeApply = dependencies.applyPreparedExecution ?? applyPreparedExecution;
   const executeUndo = dependencies.undoLastAiChange ?? undoLastAiChange;
+  const executeInitializeRepository = dependencies.initializeRepository ?? initializeRepository;
   const stdout = dependencies.stdout ?? process.stdout;
   const stderr = dependencies.stderr ?? process.stderr;
   const stdin = dependencies.stdin ?? process.stdin;
@@ -68,6 +110,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   const executeStartService = dependencies.startService ?? startService;
   let approvalStore = loadCommandApprovalStore(cwd());
   const program = new Command();
+  program.enablePositionalOptions();
 
   program
     .name("deepvibe")
@@ -152,11 +195,13 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   program
     .command("chat")
     .description("start an interactive REPL session")
-    .option("--flash", "prefer the flash model profile")
-    .option("--deep", "prefer the high-effort reasoning profile")
+    .option("--model <family>", "model family (flash or pro)")
+    .option("--effect <level>", "reasoning strength (low, medium, high, xhigh)")
+    .option("--flash", "legacy alias for --model flash --effect high")
+    .option("--deep", "legacy alias for --model pro --effect xhigh")
     .option("--session <id>", "resume a specific session by id")
     .option("--lang <language>", "interface language (en or zh)", "auto")
-    .action(async (options: { deep?: boolean; flash?: boolean; lang?: string; session?: string }) => {
+    .action(async (options: CliProfileOptions & { lang?: string; session?: string }, command: Command) => {
       const access = await prepareWorkspace({
         cwd: cwd(),
         homeDir: dependencies.homeDir,
@@ -173,12 +218,14 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       });
       const accessDependencies = withWorkspaceAccessDependencies(access, config, dependencies);
 
-      const profile = options.deep ? "deep" : options.flash ? "flash" : "default";
-      const lang = options.lang === "zh" ? "zh" : options.lang === "en" ? "en" : undefined;
+      const chatOptions = mergeCommandOptions(options, command);
+      const profile = resolveCliProfile(chatOptions);
+      const lang = chatOptions.lang === "zh" ? "zh" : chatOptions.lang === "en" ? "en" : undefined;
       await executeStartRepl({
         cwd: access.effectiveCwd,
-        profile,
-        sessionId: options.session,
+        profile: profile.legacyProfile,
+        profileSelection: profile.selection,
+        sessionId: chatOptions.session,
         lang,
         workspaceMode: access.mode,
         requestedCwd: access.requestedCwd
@@ -205,26 +252,39 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     .argument("[instruction]", "natural-language coding instruction")
     .option("--dry-run", "build the request and exit before making changes")
     .option("--force", "apply changes without interactive confirmation")
-    .option("--flash", "prefer the flash model profile")
-    .option("--deep", "prefer the high-effort reasoning profile")
+    .option("--init", "initialize a Git repository before applying changes")
+    .option("--model <family>", "model family (flash or pro)")
+    .option("--effect <level>", "reasoning strength (low, medium, high, xhigh)")
+    .option("--flash", "legacy alias for --model flash --effect high")
+    .option("--deep", "legacy alias for --model pro --effect xhigh")
     .option("--plan", "generate a multi-step plan first, then confirm and execute step by step")
-    .action(async (instruction: string | undefined, options: { deep?: boolean; dryRun?: boolean; flash?: boolean; force?: boolean; plan?: boolean }) => {
+    .action(async (instruction: string | undefined, options: CliProfileOptions & { dryRun?: boolean; force?: boolean; init?: boolean; plan?: boolean }) => {
       if (!instruction) {
         program.outputHelp();
         return;
       }
 
+      const profile = resolveCliProfile(options);
+      const requestedCwd = cwd();
       const executionOptions = {
         instruction,
-        cwd: cwd(),
+        cwd: requestedCwd,
         dryRun: Boolean(options.dryRun),
         planMode: Boolean(options.plan),
-        profile: options.deep ? "deep" : options.flash ? "flash" : "default"
+        profile: profile.legacyProfile,
+        profileSettings: profile.profileSettings
       } as const;
 
       if (options.plan) {
+        await maybeInitializeRepository({
+          cwd: requestedCwd,
+          enabled: Boolean(options.init),
+          initializeRepository: executeInitializeRepository,
+          inspectRepository: dependencies.inspectRepository ?? inspectRepository,
+          output: stdout
+        });
         const access = await prepareWorkspace({
-          cwd: cwd(),
+          cwd: requestedCwd,
           homeDir: dependencies.homeDir,
           input: stdin,
           output: stdout
@@ -293,8 +353,15 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
             return executeRunEngine({ ...executionOptions, cwd: access.effectiveCwd }, withWorkspaceAccessDependencies(access, loadConfig({ cwd: access.effectiveCwd, homeDir: dependencies.homeDir }), dependencies));
           })()
         : await (async () => {
+            await maybeInitializeRepository({
+              cwd: requestedCwd,
+              enabled: Boolean(options.init),
+              initializeRepository: executeInitializeRepository,
+              inspectRepository: dependencies.inspectRepository ?? inspectRepository,
+              output: stdout
+            });
             const access = await prepareWorkspace({
-              cwd: cwd(),
+              cwd: requestedCwd,
               homeDir: dependencies.homeDir,
               input: stdin,
               output: stdout
@@ -675,381 +742,6 @@ async function runPlanExecution(
   return { message: formatPlanResults(stepResults) };
 }
 
-async function confirmPlan(
-  plan: { overview: string; steps: Array<{ index: number; description: string; files: string[]; estimatedChanges: string }>; notes: string },
-  streams: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream }
-): Promise<boolean> {
-  const readline = createInterface({
-    input: streams.input,
-    output: streams.output
-  });
-
-  try {
-    while (true) {
-      const answer = (await readline.question("Proceed with plan? [A]ccept [R]eject: ")).trim().toLowerCase();
-
-      if (answer === "a" || answer === "accept" || answer === "y" || answer === "yes") {
-        return true;
-      }
-
-      if (answer === "r" || answer === "reject" || answer === "n" || answer === "no") {
-        return false;
-      }
-    }
-  } finally {
-    readline.close();
-  }
-}
-
-export async function confirmPlanStep(
-  stepIndex: number,
-  totalSteps: number,
-  prepared: PreparedExecution,
-  streams: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream }
-): Promise<boolean> {
-  const readline = createInterface({
-    input: streams.input,
-    output: streams.output
-  });
-
-  try {
-    streams.output.write(`\n--- Step ${stepIndex}/${totalSteps} ---\n`);
-    streams.output.write(`${formatPreparedExecutionSummary(prepared)}\n`);
-
-    while (true) {
-      const answer = (await readline.question("Confirm apply? [A]ccept [S]kip [R]eview [N]o (stop plan): ")).trim().toLowerCase();
-
-      if (answer === "a" || answer === "accept" || answer === "y" || answer === "yes") {
-        return true;
-      }
-
-      if (answer === "s" || answer === "skip") {
-        return false;
-      }
-
-      if (answer === "n" || answer === "no") {
-        throw new Error("Plan execution stopped by user.");
-      }
-
-      if (answer === "r" || answer === "review") {
-        const reviewResult = await reviewPreparedExecutionFiles(prepared, readline, streams.output);
-
-        if (reviewResult === "apply") {
-          return true;
-        }
-
-        if (reviewResult === "skip") {
-          return false;
-        }
-      }
-    }
-  } finally {
-    readline.close();
-  }
-}
-
-export function formatPlan(plan: { overview: string; steps: Array<{ index: number; description: string; files: string[]; estimatedChanges: string }>; notes: string }): string {
-  const lines = [
-    `Plan: ${plan.overview}`,
-    ""
-  ];
-
-  for (const step of plan.steps) {
-    lines.push(`  ${step.index}. ${step.description} (${step.estimatedChanges})`);
-    lines.push(`     Files: ${step.files.join(", ") || "(none specified)"}`);
-  }
-
-  if (plan.notes) {
-    lines.push("");
-    lines.push(`Notes: ${plan.notes}`);
-  }
-
-  return lines.join("\n");
-}
-
-export function formatPlanResults(results: PlanStepResult[]): string {
-  const completed = results.filter((r) => r.status === "completed").length;
-  const skipped = results.filter((r) => r.status === "skipped").length;
-  const failed = results.filter((r) => r.status === "failed").length;
-
-  const lines = [
-    `Plan execution complete: ${completed} completed, ${skipped} skipped, ${failed} failed`
-  ];
-
-  for (const result of results) {
-    const icon = result.status === "completed" ? "✓" : result.status === "skipped" ? "⊘" : "✗";
-    lines.push(`  ${icon} Step ${result.stepIndex}: ${result.summary}`);
-  }
-
-  return lines.join("\n");
-}
-
-export async function confirmPreparedExecution(
-  prepared: PreparedExecution,
-  streams: {
-    input: NodeJS.ReadableStream;
-    output: NodeJS.WritableStream;
-  }
-): Promise<boolean> {
-  const readline = createInterface({
-    input: streams.input,
-    output: streams.output
-  });
-
-  try {
-    streams.output.write(`${formatPreparedExecutionSummary(prepared)}\n`);
-
-    while (true) {
-      const answer = (await readline.question("Confirm apply? [A]ccept [R]eview [N]o: ")).trim().toLowerCase();
-
-      if (answer === "a" || answer === "accept" || answer === "y" || answer === "yes") {
-        return true;
-      }
-
-      if (answer === "n" || answer === "no" || answer === "reject") {
-        return false;
-      }
-
-      if (answer === "r" || answer === "review") {
-        const reviewResult = await reviewPreparedExecutionFiles(prepared, readline, streams.output);
-
-        if (reviewResult === "apply" || reviewResult === "skip") {
-          return true;
-        }
-
-        if (reviewResult === "cancel") {
-          return false;
-        }
-      }
-    }
-  } finally {
-    readline.close();
-  }
-}
-
-export async function confirmLandingPreparedExecution(
-  prepared: PreparedExecution,
-  streams: {
-    input: NodeJS.ReadableStream;
-    output: NodeJS.WritableStream;
-  }
-): Promise<boolean> {
-  const readline = createInterface({
-    input: streams.input,
-    output: streams.output
-  });
-
-  try {
-    streams.output.write(`${formatLandingExecutionSummary(prepared)}\n`);
-
-    while (true) {
-      const answer = (await readline.question("Land sandbox changes to the real workspace? [A]ccept [R]eview [N]o: ")).trim().toLowerCase();
-
-      if (answer === "a" || answer === "accept" || answer === "y" || answer === "yes") {
-        return true;
-      }
-
-      if (answer === "n" || answer === "no" || answer === "reject") {
-        return false;
-      }
-
-      if (answer === "r" || answer === "review") {
-        const reviewResult = await reviewPreparedExecutionFiles(prepared, readline, streams.output);
-
-        if (reviewResult === "apply" || reviewResult === "skip") {
-          return true;
-        }
-
-        if (reviewResult === "cancel") {
-          return false;
-        }
-      }
-    }
-  } finally {
-    readline.close();
-  }
-}
-
-export function formatPreparedExecutionSummary(prepared: PreparedExecution): string {
-  const lines = [
-    `Planned changes: ${prepared.parsedResponse.files.length} file(s)`,
-    `Summary: ${prepared.parsedResponse.summary}`,
-    "Files:"
-  ];
-
-  for (const file of prepared.parsedResponse.files) {
-    const stats = countDiffLines(file.diff);
-    lines.push(`- [${file.action}] ${file.path} (+${stats.additions} -${stats.deletions})`);
-  }
-
-  return lines.join("\n");
-}
-
-export function formatLandingExecutionSummary(prepared: PreparedExecution): string {
-  const lines = [
-    "=== Sandbox Landing Review ===",
-    "These are the actual file changes that will be written back from the sandbox copy into the real workspace.",
-    `Landing changes: ${prepared.parsedResponse.files.length} file(s)`,
-    `Summary: ${prepared.parsedResponse.summary}`,
-    "Files:"
-  ];
-
-  for (const file of prepared.parsedResponse.files) {
-    const stats = countDiffLines(file.diff);
-    lines.push(`- [${file.action}] ${file.path} (+${stats.additions} -${stats.deletions})`);
-  }
-
-  return lines.join("\n");
-}
-
-export function formatPreparedExecutionDiffs(prepared: PreparedExecution): string {
-  const sections: string[] = [];
-
-  for (const file of prepared.parsedResponse.files) {
-    sections.push(`--- ${file.action.toUpperCase()} ${file.path} ---`);
-    sections.push(file.diff);
-    sections.push(`--- END ${file.path} ---`);
-  }
-
-  return sections.join("\n");
-}
-
-export async function reviewPreparedExecutionFiles(
-  prepared: PreparedExecution,
-  readline: ReturnType<typeof createInterface>,
-  output: NodeJS.WritableStream
-): Promise<"apply" | "skip" | "cancel"> {
-  const originalFiles = [...prepared.parsedResponse.files];
-  const selectedFiles: PreparedExecution["parsedResponse"]["files"] = [];
-  let applyAllRemaining = false;
-
-  for (const file of originalFiles) {
-    if (applyAllRemaining) {
-      selectedFiles.push(file);
-      continue;
-    }
-
-    output.write(`--- ${file.action.toUpperCase()} ${file.path} ---\n`);
-    output.write(`${file.diff}\n`);
-    output.write(`--- END ${file.path} ---\n`);
-
-    while (true) {
-      const answer = (await readline.question("Apply this file? [Y]es [S]kip [A]ll remaining [Q]uit: ")).trim().toLowerCase();
-
-      if (answer === "y" || answer === "yes") {
-        selectedFiles.push(file);
-        break;
-      }
-
-      if (answer === "s" || answer === "skip" || answer === "n" || answer === "no") {
-        break;
-      }
-
-      if (answer === "a" || answer === "all" || answer === "always") {
-        selectedFiles.push(file);
-        applyAllRemaining = true;
-        break;
-      }
-
-      if (answer === "q" || answer === "quit" || answer === "c" || answer === "cancel" || answer === "r" || answer === "reject") {
-        return "cancel";
-      }
-    }
-  }
-
-  prepared.parsedResponse.files = selectedFiles;
-  output.write(`Selected ${selectedFiles.length} of ${originalFiles.length} file(s) for apply.\n`);
-
-  return selectedFiles.length > 0 ? "apply" : "skip";
-}
-
-export async function confirmCommandExecution(
-  request: CommandApprovalRequest,
-  streams: {
-    allowPersistentApproval?: boolean;
-    input: NodeJS.ReadableStream;
-    output: NodeJS.WritableStream;
-  }
-): Promise<"approve_once" | "approve_and_remember" | "deny"> {
-  const readline = createInterface({
-    input: streams.input,
-    output: streams.output
-  });
-
-  try {
-    streams.output.write(`Tool wants to run a command.\n`);
-    streams.output.write(`Working directory: ${request.cwd}\n`);
-    streams.output.write(`Command: ${request.command}\n`);
-    streams.output.write(`Risk: ${request.risk}\n`);
-
-    while (true) {
-      const prompt =
-        request.risk === "low"
-          ? streams.allowPersistentApproval
-            ? "Allow low-risk command? [Y]es once [A]lways [N]o: "
-            : "Allow low-risk command? [Y]es [N]o: "
-          : request.risk === "medium"
-            ? "Allow medium-risk command once? [Y]es [N]o: "
-            : 'High-risk command. Type "allow" to continue or [N]o: ';
-      const answer = (await readline.question(prompt)).trim().toLowerCase();
-
-      if (request.risk === "high") {
-        if (answer === "allow") {
-          return "approve_once";
-        }
-
-        if (answer === "n" || answer === "no") {
-          return "deny";
-        }
-
-        continue;
-      }
-
-      if (request.risk === "low" && streams.allowPersistentApproval && (answer === "a" || answer === "always")) {
-        return "approve_and_remember";
-      }
-
-      if (answer === "y" || answer === "yes") {
-        return "approve_once";
-      }
-
-      if (answer === "n" || answer === "no") {
-        return "deny";
-      }
-    }
-  } finally {
-    readline.close();
-  }
-}
-
-function ensureInteractiveConfirmationAvailable(
-  input: NodeJS.ReadableStream,
-  output: NodeJS.WritableStream
-): void {
-  if (!("isTTY" in input) || !input.isTTY || !("isTTY" in output) || !output.isTTY) {
-    throw new Error("Interactive confirmation requires a TTY. Re-run with --force to skip confirmation.");
-  }
-}
-
-function countDiffLines(diff: string): { additions: number; deletions: number } {
-  let additions = 0;
-  let deletions = 0;
-
-  for (const line of diff.split(/\r?\n/u)) {
-    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) {
-      continue;
-    }
-
-    if (line.startsWith("+")) {
-      additions += 1;
-    } else if (line.startsWith("-")) {
-      deletions += 1;
-    }
-  }
-
-  return { additions, deletions };
-}
-
 function parsePortOption(value: string): number {
   const port = Number(value);
 
@@ -1058,6 +750,104 @@ function parsePortOption(value: string): number {
   }
 
   return port;
+}
+
+interface CliProfileOptions {
+  deep?: boolean;
+  effect?: string;
+  flash?: boolean;
+  lang?: string;
+  model?: string;
+  session?: string;
+}
+
+function mergeCommandOptions<T extends CliProfileOptions>(options: T, command: Command): T {
+  return {
+    ...(command.parent?.opts() as CliProfileOptions | undefined),
+    ...command.opts(),
+    ...options
+  } as T;
+}
+
+function resolveCliProfile(options: CliProfileOptions): {
+  legacyProfile: ExecutionProfile;
+  profileSettings: ReturnType<typeof resolveReplModelProfile>;
+  selection: ReplProfileSelection;
+} {
+  const deep = readCliOption<boolean>(options, "deep");
+  const flash = readCliOption<boolean>(options, "flash");
+  const model = readCliOption<string>(options, "model");
+  const effect = readCliOption<string>(options, "effect");
+  const legacyProfile: ExecutionProfile = deep ? "deep" : flash ? "flash" : "default";
+  const selection = {
+    ...resolveReplProfileSelection(legacyProfile)
+  };
+
+  if (model !== undefined) {
+    selection.model = parseModelFamily(model);
+  }
+
+  if (effect !== undefined) {
+    selection.effect = parseReasoningEffect(effect);
+  }
+
+  return {
+    legacyProfile,
+    profileSettings: resolveReplModelProfile(selection),
+    selection
+  };
+}
+
+function readCliOption<T>(options: CliProfileOptions, key: keyof CliProfileOptions): T | undefined {
+  const direct = options[key] as T | undefined;
+
+  if (direct !== undefined) {
+    return direct;
+  }
+
+  const opts = (options as CliProfileOptions & { opts?: () => CliProfileOptions }).opts?.();
+  return opts?.[key] as T | undefined;
+}
+
+function parseModelFamily(value: string): ReplModelFamily {
+  if (value === "flash") {
+    return "deepseek-v4-flash";
+  }
+
+  if (value === "pro") {
+    return "deepseek-v4-pro";
+  }
+
+  throw new Error(`Unsupported model family "${value}". Expected flash or pro.`);
+}
+
+function parseReasoningEffect(value: string): ReplReasoningEffect {
+  if (value === "low" || value === "medium" || value === "high" || value === "xhigh") {
+    return value;
+  }
+
+  throw new Error(`Unsupported reasoning effect "${value}". Expected low, medium, high, or xhigh.`);
+}
+
+async function maybeInitializeRepository(options: {
+  cwd: string;
+  enabled: boolean;
+  initializeRepository: typeof initializeRepository;
+  inspectRepository: typeof inspectRepository;
+  output: NodeJS.WritableStream;
+}): Promise<void> {
+  if (!options.enabled) {
+    return;
+  }
+
+  const repositoryState = await options.inspectRepository(options.cwd);
+
+  if (repositoryState.isRepository) {
+    return;
+  }
+
+  await options.initializeRepository(options.cwd);
+  options.output.write("Git repository initialized.\n");
 }
 
 function createCommandApprovalHandler(options: {

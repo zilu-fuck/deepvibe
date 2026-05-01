@@ -8,6 +8,7 @@ import { buildContext } from "../src/context/builder.js";
 import { loadContextStore } from "../src/context-store.js";
 import { ConfigError } from "../src/config.js";
 import { applyPreparedExecution, EngineError, executePlanSteps, executeReplTurn, generatePlan, runEngine } from "../src/engine.js";
+import { resolveModelProfile } from "../src/model-profile.js";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -235,7 +236,7 @@ describe("executeReplTurn", () => {
         conversationMessages: [],
         cwd,
         instruction: "Hello",
-        profile: "default"
+        profileSettings: resolveModelProfile("default")
       },
       {
         inspectRepository: async () => ({

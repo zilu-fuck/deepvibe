@@ -99,7 +99,7 @@ const translations: Record<Language, TranslationDictionary> = {
     "error.prefix": "Error:",
     "session.not_found": "Session not found: {id}. Starting with default session.",
 
-    "error.GIT_REQUIRED": "DeepVibe requires a Git repository. Run `git init` in this directory first.",
+    "error.GIT_REQUIRED": "DeepVibe requires a Git repository. Run `git init`, pass `--init`, or use `deepvibe chat` for the interactive setup flow.",
     "error.API_KEY_MISSING": "DeepSeek API key is not configured. Use `deepvibe config set api_key YOUR_KEY` to set it.",
     "error.CANCELED": "Execution was canceled.",
     "error.MODEL_EMPTY": "Model did not return a completion. Try again with a different instruction.",
@@ -136,6 +136,7 @@ const translations: Record<Language, TranslationDictionary> = {
     "cmd.help.switch": "  /switch <id>  切换到指定会话",
     "cmd.help.effect": "  /effect [模式] 切换思考强度 (low/medium/high/xhigh)",
     "cmd.help.model": "  /model [名称] 切换模型系列 (flash/pro)",
+    "cmd.help.cost": "  /cost         显示本会话 token 和费用统计",
     "cmd.help.multiline": "  /multiline    捕获多行输入（空行发送）",
     "cmd.help.thoughts": "  /thoughts     打开最近一条被收起的思考过程",
     "cmd.help.clear": "  /clear        清屏",
@@ -180,7 +181,7 @@ const translations: Record<Language, TranslationDictionary> = {
     "error.prefix": "错误：",
     "session.not_found": "未找到会话：{id}，将使用默认会话。",
 
-    "error.GIT_REQUIRED": "DeepVibe 需要在 Git 仓库中运行。请先在此目录执行 `git init`。",
+    "error.GIT_REQUIRED": "DeepVibe 需要在 Git 仓库中运行。请先执行 `git init`、传入 `--init`，或使用 `deepvibe chat` 进入交互式初始化流程。",
     "error.API_KEY_MISSING": "DeepSeek API Key 未配置。请使用 `deepvibe config set api_key 你的KEY` 进行设置。",
     "error.CANCELED": "执行已被取消。",
     "error.MODEL_EMPTY": "模型未返回结果，请尝试用不同的方式描述需求。",
