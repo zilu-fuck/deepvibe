@@ -2,6 +2,8 @@
 
 CLI-first AI coding engine for DeepSeek workflows.
 
+[中文说明](./README.zh-CN.md)
+
 ## Status
 
 This repository currently contains the `M1` MVP foundation:
@@ -385,6 +387,8 @@ Start an interactive REPL session:
 pnpm cli chat
 pnpm cli chat --flash      # prefer flash model
 pnpm cli chat --deep       # prefer deep reasoning
+pnpm cli chat --lang zh    # force Chinese interface
+pnpm cli chat --lang en    # force English interface
 pnpm cli chat --session <id>   # resume a specific session
 ```
 
@@ -392,14 +396,21 @@ In the REPL:
 - if the current directory is not a Git repository, DeepVibe starts in chat-only mode
 - Type any instruction and the engine will analyze, stream the response, and prompt for confirmation
 - When changes are proposed, use `[A]ccept`, `[R]eview` (to see diffs), or `[N]o`
+- pasted multi-line text is auto-grouped into one turn when lines arrive as a burst
+- triple-backtick fenced blocks are auto-captured as one turn; use `.cancel` before the closing fence to abort
 - Slash commands:
-  - `/new` — start a new session
-  - `/history` — show conversation history
-  - `/sessions` — list all sessions
-  - `/switch <id>` — switch to a different session
-  - `/clear` — clear the screen (TTY only)
-  - `/help` — show help
-  - `/quit` or `/exit` — exit the REPL
+  - `/new` - start a new session
+  - `/history` - show conversation history
+  - `/sessions` - list all sessions
+  - `/switch <id>` - switch to a different session
+  - `/effect [low|medium|high|xhigh]` - set reasoning strength; with no argument, cycle to the next level
+  - `/model [flash|pro]` - set the model family; with no argument, toggle to the other family
+  - `/cost` - show metered turn counts, last-turn usage, and session totals
+  - `/multiline` - enter explicit multi-line capture mode; submit with an empty line, or cancel with `.cancel`
+  - `/thoughts` - open the latest hidden reasoning trace viewer
+  - `/clear` - clear the screen (TTY only)
+  - `/help` - show help
+  - `/quit` or `/exit` - exit the REPL
 
 **Sessions:**
 - Each session maintains its own conversation history and turn history
@@ -458,26 +469,26 @@ pnpm release:smoke
 
 Detailed release notes:
 
-- [docs/发布流程.md](</F:/deepseek code/docs/发布流程.md>)
+- [docs/发布流程.md](./docs/发布流程.md)
 
 ## Repository Notes
 
 Key implementation files:
 
-- [src/engine.ts](</F:/deepseek code/src/engine.ts>)
-- [src/cli.ts](</F:/deepseek code/src/cli.ts>)
-- [src/repl.ts](</F:/deepseek code/src/repl.ts>)
-- [src/context-store.ts](</F:/deepseek code/src/context-store.ts>)
-- [src/search.ts](</F:/deepseek code/src/search.ts>)
-- [src/tools.ts](</F:/deepseek code/src/tools.ts>)
-- [src/project/scanner.ts](</F:/deepseek code/src/project/scanner.ts>)
-- [src/context/builder.ts](</F:/deepseek code/src/context/builder.ts>)
-- [src/llm/deepseek-client.ts](</F:/deepseek code/src/llm/deepseek-client.ts>)
-- [src/llm/response-parser.ts](</F:/deepseek code/src/llm/response-parser.ts>)
-- [src/patcher.ts](</F:/deepseek code/src/patcher.ts>)
-- [src/project/git-manager.ts](</F:/deepseek code/src/project/git-manager.ts>)
+- [src/engine.ts](./src/engine.ts)
+- [src/cli.ts](./src/cli.ts)
+- [src/repl.ts](./src/repl.ts)
+- [src/context-store.ts](./src/context-store.ts)
+- [src/search.ts](./src/search.ts)
+- [src/tools.ts](./src/tools.ts)
+- [src/project/scanner.ts](./src/project/scanner.ts)
+- [src/context/builder.ts](./src/context/builder.ts)
+- [src/llm/deepseek-client.ts](./src/llm/deepseek-client.ts)
+- [src/llm/response-parser.ts](./src/llm/response-parser.ts)
+- [src/patcher.ts](./src/patcher.ts)
+- [src/project/git-manager.ts](./src/project/git-manager.ts)
 
 Design references:
 
-- [docs/项目计划.md](</F:/deepseek code/docs/项目计划.md>)
-- [docs/开发任务拆解.md](</F:/deepseek code/docs/开发任务拆解.md>)
+- [docs/项目计划.md](./docs/项目计划.md)
+- [docs/开发任务拆解.md](./docs/开发任务拆解.md)
