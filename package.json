@@ -1,0 +1,55 @@
+{
+  "name": "deepvibe-core",
+  "version": "0.1.0",
+  "description": "CLI-first AI coding engine optimized for DeepSeek workflows.",
+  "type": "module",
+  "bin": {
+    "deepvibe": "./dist/index.js"
+  },
+  "files": [
+    "dist/*.js",
+    "dist/*.cjs",
+    "dist/*.d.ts",
+    "dist/**/*.js",
+    "dist/**/*.cjs",
+    "dist/**/*.d.ts",
+    "dist/**/*.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node ./scripts/copy-plugin-host.mjs",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "cli": "tsx src/index.ts",
+    "pack:dryrun": "npm pack --dry-run",
+    "prepublishOnly": "pnpm check && pnpm test && pnpm build",
+    "release:check": "pnpm check && pnpm test && pnpm build && pnpm pack:dryrun",
+    "release:smoke": "node ./scripts/release-smoke.mjs",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "cli",
+    "deepseek",
+    "typescript",
+    "ai"
+  ],
+  "license": "MIT",
+  "packageManager": "pnpm@10.32.1",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "commander": "^14.0.1",
+    "diff": "^8.0.2",
+    "fast-glob": "^3.3.3",
+    "ignore": "^7.0.5",
+    "js-tiktoken": "^1.0.21",
+    "simple-git": "^3.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.7"
+  }
+}

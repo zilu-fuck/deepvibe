@@ -1,0 +1,19 @@
+# Source files
+src/
+tests/
+docs/
+scripts/
+
+# Config files
+tsconfig.json
+tsconfig.build.json
+vitest.config.ts
+pnpm-lock.yaml
+
+# Development
+node_modules/
+.gitignore
+.npmignore
+
+# Source maps (not needed in published package)
+dist/**/*.js.map

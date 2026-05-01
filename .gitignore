@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.log
+
+.claude/settings.local.json
+.deepvibe/config.json
+.deepvibe/operations/
+.deepvibe/context.json
+.deepvibe/command-approvals.json
+.deepvibe/last-action.json
