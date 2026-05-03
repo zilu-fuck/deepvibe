@@ -1,14 +1,17 @@
 ﻿import path from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
+import { Writable } from "node:stream";
 
 import { createStreamingChatBubbleWriter, renderChatBubble } from "./chat-bubble.js";
 import {
   appendContextTurn,
   loadChatHistory,
   loadContextStore,
+  loadDisplayHistory,
   listSessions,
   switchSession,
-  updateChatHistory
+  updateChatHistory,
+  updateDisplayHistory
 } from "./context-store.js";
 import {
   addUsage,
@@ -21,6 +24,7 @@ import {
   type RunEngineDependencies
 } from "./engine.js";
 import { detectLanguage, t, type Language } from "./i18n.js";
+import { detectEngineeringIntent } from "./intent.js";
 import type { ChatMessage, DeepSeekUsage } from "./llm/deepseek-client.js";
 import {
   resolveReplModelProfile,
@@ -37,6 +41,7 @@ import {
 } from "./multiline.js";
 import { inspectPluginDiscovery } from "./plugins.js";
 import { initializeRepository, inspectRepository } from "./project/git-manager.js";
+import { applyBootstrapGuidance } from "./project-bootstrap.js";
 import { confirmReplExecution } from "./review.js";
 import { completeReplInput, handleSlashCommand } from "./slash-command.js";
 import {
@@ -74,9 +79,34 @@ function formatError(error: unknown, lang: Language): string {
   return error instanceof Error ? error.message : "Unknown error.";
 }
 
+function writeChat(
+  persistentStatusArea: PersistentStatusArea | null,
+  stdout: NodeJS.WritableStream,
+  text: string
+): void {
+  if (persistentStatusArea) {
+    persistentStatusArea.writeChatRaw(text);
+  } else {
+    stdout.write(text);
+  }
+}
+
+function createChatPanelWriter(
+  persistentStatusArea: PersistentStatusArea,
+  fallback: NodeJS.WritableStream
+): NodeJS.WritableStream {
+  return new Writable({
+    write(chunk: Buffer | string, _encoding: string, callback: (error?: Error | null) => void) {
+      persistentStatusArea.writeChatRaw(typeof chunk === "string" ? chunk : chunk.toString());
+      callback();
+    }
+  });
+}
+
 export interface ReplDependencies extends RunEngineDependencies {
   applyPreparedExecution?: typeof applyPreparedExecution;
   confirmReplExecution?: typeof confirmReplExecution;
+  detectEngineeringIntent?: typeof detectEngineeringIntent;
   executeReplTurn?: typeof executeReplTurn;
   initializeRepository?: typeof initializeRepository;
   stdin?: NodeJS.ReadableStream;
@@ -102,6 +132,7 @@ export async function startRepl(
   const executeTurn = dependencies.executeReplTurn ?? executeReplTurn;
   const executeApply = dependencies.applyPreparedExecution ?? applyPreparedExecution;
   const confirmExec = dependencies.confirmReplExecution ?? confirmReplExecution;
+  const executeDetectEngineeringIntent = dependencies.detectEngineeringIntent ?? detectEngineeringIntent;
   const executeInitializeRepository = dependencies.initializeRepository ?? initializeRepository;
   const lang = options.lang ?? detectLanguage();
   let currentSelection = options.profileSelection ?? resolveReplProfileSelection(options.profile);
@@ -139,6 +170,7 @@ export async function startRepl(
   }
 
   let chatHistory: ChatMessage[] = loadChatHistory(store);
+  let displayHistory: ChatMessage[] = loadDisplayHistory(store);
   let lastReasoningTrace = "";
   let lastTurnUsage: DeepSeekUsage | null = null;
   let lastTurnUsageProfile: ReplProfileSelection = { ...currentSelection };
@@ -146,6 +178,8 @@ export async function startRepl(
   const sessionUsageById = new Map<string, SessionUsageSnapshot>();
   let multilineCapture: MultilineCapture | null = null;
   let repositoryState: { isRepository: boolean; isDirty: boolean } = { isRepository: false, isDirty: false };
+  let repoInitPromptInstruction: string | null = null;
+  const gitCwd = options.requestedCwd ?? options.cwd;
   const ensureSessionUsage = (sessionId: string) => {
     if (!sessionUsageById.has(sessionId)) {
       sessionUsageById.set(sessionId, createSessionUsageSnapshot());
@@ -156,10 +190,12 @@ export async function startRepl(
   ensureSessionUsage(store.currentSessionId);
 
   try {
-    repositoryState = await (dependencies.inspectRepository ?? inspectRepository)(options.cwd);
+    repositoryState = await (dependencies.inspectRepository ?? inspectRepository)(gitCwd);
   } catch {
     // Non-git directory: inspectRepository may throw; REPL works in chat-only mode
   }
+
+  const isStdinTTY = (stdin as NodeJS.ReadableStream & { isTTY?: boolean }).isTTY === true;
 
   const readline = createInterface({
     completer: (line) =>
@@ -172,14 +208,23 @@ export async function startRepl(
   });
   const persistentStatusArea = createPersistentStatusArea(stdout, {
     renderStatusPanel: renderCurrentStatusPanel,
-    renderWelcomeBanner: () => renderWelcomeBanner(lang)
-  });
+    renderWelcomeBanner: () => renderWelcomeBanner(lang, stdout),
+    renderInputPanel: (_contentWidth: number) => ""
+  }, lang);
   const syncPrompt = () => {
     readline.setPrompt(multilineCapture ? t("repl.prompt.multiline", lang) : t("repl.prompt", lang));
   };
 
   let isClosed = false;
   let exitReason = "eof";
+
+  const onResize = () => {
+    persistentStatusArea?.handleResize();
+  };
+
+  if (persistentStatusArea) {
+    process.stdout.on("resize", onResize);
+  }
 
   readline.on("close", () => {
     isClosed = true;
@@ -197,10 +242,25 @@ export async function startRepl(
   });
 
   try {
+    if (!repositoryState.isRepository && isStdinTTY) {
+      try {
+        const answer = (await readline.question(t("repl.repo_init.startup_prompt", lang))).trim().toLowerCase();
+        if (answer === "y" || answer === "yes" || answer.length === 0) {
+          await executeInitializeRepository(gitCwd);
+          repositoryState = await (dependencies.inspectRepository ?? inspectRepository)(gitCwd);
+          stdout.write(renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.done", lang)));
+        } else {
+          stdout.write(renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.declined", lang)));
+        }
+      } catch (error) {
+        stdout.write(renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.failed", lang, { message: formatError(error, lang) })));
+      }
+    }
+
     if (persistentStatusArea) {
       persistentStatusArea.initialize();
     } else {
-      stdout.write(renderWelcomeBanner(lang));
+      stdout.write(renderWelcomeBanner(lang, stdout));
       stdout.write(renderCurrentStatusPanel());
     }
 
@@ -240,7 +300,7 @@ export async function startRepl(
         syncPrompt();
 
         if (completion.status === "canceled") {
-          stdout.write(t("cmd.multiline.canceled", lang) + "\n");
+          writeChat(persistentStatusArea, stdout, t("cmd.multiline.canceled", lang) + "\n");
           if (!isClosed) readline.prompt();
           continue;
         }
@@ -252,7 +312,7 @@ export async function startRepl(
         if (autoCapture) {
           multilineCapture = autoCapture;
           syncPrompt();
-          stdout.write(t("cmd.multiline.started_fence", lang) + "\n");
+          writeChat(persistentStatusArea, stdout, t("cmd.multiline.started_fence", lang) + "\n");
           if (!isClosed) readline.prompt();
           continue;
         }
@@ -286,6 +346,10 @@ export async function startRepl(
           setChatHistory: (next) => {
             chatHistory = next;
           },
+          getDisplayHistory: () => displayHistory,
+          setDisplayHistory: (next) => {
+            displayHistory = next;
+          },
           getLastReasoningTrace: () => lastReasoningTrace,
           getProfile: () => currentSelection,
           setProfile: (next) => {
@@ -299,7 +363,7 @@ export async function startRepl(
             syncPrompt();
           },
           renderStatusPanel: renderCurrentStatusPanel,
-          renderWelcomeBanner: () => renderWelcomeBanner(lang)
+          renderWelcomeBanner: () => renderWelcomeBanner(lang, stdout)
         });
 
         if (handled === "quit") {
@@ -313,41 +377,104 @@ export async function startRepl(
         continue;
       }
 
-      if (!repositoryState.isRepository && looksLikeEngineeringIntent(input)) {
-        stdout.write(renderChatBubble(t("repl.panel.user", lang), input));
-        const initialized = await maybeInitializeRepository({
-          cwd: options.cwd,
-          inspectRepository: dependencies.inspectRepository ?? inspectRepository,
-          initializeRepository: executeInitializeRepository,
-          lang,
-          output: stdout,
-          readline
-        });
+      let effectiveInput = input;
+      let repositoryJustInitialized = false;
+      let repoInitJustAnswered = false;
+      let displayUserMessage: string | null = null;
 
-        if (initialized) {
-          repositoryState = initialized;
-          persistentStatusArea?.refresh();
+      if (repoInitPromptInstruction) {
+        const storedInstruction = repoInitPromptInstruction;
+        repoInitPromptInstruction = null;
+        repoInitJustAnswered = true;
+        const answer = input.trim().toLowerCase();
+
+        if (answer === "n" || answer === "no") {
+          writeChat(persistentStatusArea, stdout, renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.declined", lang)));
+          effectiveInput = storedInstruction;
+        } else if (answer === "y" || answer === "yes" || answer.length === 0) {
+          try {
+            await executeInitializeRepository(gitCwd);
+            repositoryState = await (dependencies.inspectRepository ?? inspectRepository)(gitCwd);
+            repositoryJustInitialized = true;
+            persistentStatusArea?.refresh();
+            writeChat(persistentStatusArea, stdout, renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.done", lang)));
+          } catch (error) {
+            writeChat(persistentStatusArea, stdout, renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.failed", lang, { message: formatError(error, lang) })));
+            repositoryState = await (dependencies.inspectRepository ?? inspectRepository)(gitCwd);
+          }
+          effectiveInput = storedInstruction;
+        } else {
+          writeChat(persistentStatusArea, stdout, renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.declined", lang)));
+          effectiveInput = storedInstruction;
         }
-      } else {
-        stdout.write(renderChatBubble(t("repl.panel.user", lang), input));
       }
 
+      if (!repositoryState.isRepository) {
+        if (!repoInitJustAnswered) {
+        const intentDecision = await executeDetectEngineeringIntent(
+          {
+            conversationMessages: chatHistory,
+            cwd: options.cwd,
+            instruction: effectiveInput,
+            profileSettings: resolveReplModelProfile(currentSelection)
+          },
+          {
+            createClient: dependencies.createClient
+          }
+        );
+
+        if (intentDecision.requiresWriteAccess) {
+          writeChat(persistentStatusArea, stdout, renderChatBubble(t("repl.panel.user", lang), effectiveInput, persistentStatusArea?.getContentWidth()));
+          displayUserMessage = effectiveInput;
+          writeChat(persistentStatusArea, stdout, renderPanelMessage(t("repl.panel.workspace", lang), t("repl.repo_init.prompt", lang)));
+          repoInitPromptInstruction = effectiveInput;
+          syncPrompt();
+          if (!isClosed) readline.prompt();
+          continue;
+        } else {
+          writeChat(persistentStatusArea, stdout, renderChatBubble(t("repl.panel.user", lang), effectiveInput, persistentStatusArea?.getContentWidth()));
+          displayUserMessage = effectiveInput;
+        }
+        }
+      } else {
+        writeChat(persistentStatusArea, stdout, renderChatBubble(t("repl.panel.user", lang), input, persistentStatusArea?.getContentWidth()));
+        displayUserMessage = input;
+      }
+
+      if (displayUserMessage) {
+        displayHistory = [...displayHistory, { role: "user", content: displayUserMessage }];
+      }
+
+      const bootstrapGuidance = applyBootstrapGuidance({
+        cwd: options.cwd,
+        instruction: input,
+        repositoryJustInitialized
+      });
+
+      if (bootstrapGuidance.notice) {
+        writeChat(persistentStatusArea, stdout, renderPanelMessage(t("repl.panel.workspace", lang), bootstrapGuidance.notice));
+      }
+
+      effectiveInput = bootstrapGuidance.instruction;
+
       const thinkingStatus = createThinkingStatus(stdout, lang);
-      const assistantBubble = createStreamingChatBubbleWriter(stdout, t("repl.panel.assistant", lang));
+      const assistantBubble = createStreamingChatBubbleWriter(stdout, t("repl.panel.assistant", lang), persistentStatusArea?.getContentWidth());
 
       try {
         let reasoningAnnounced = false;
         let streamedContent = "";
         let streamedReasoning = "";
+        let visibleAssistantMessage = "";
 
         thinkingStatus.start();
-        stdout.write(`${t("repl.preflight", lang)}\n`);
+        writeChat(persistentStatusArea, stdout, `${t("repl.preflight", lang)}\n`);
 
         currentTurnController = new AbortController();
 
         const callbacks: ReplTurnCallbacks = {
           onContent: (chunk) => {
             streamedContent += chunk;
+            visibleAssistantMessage += chunk;
             thinkingStatus.stop({ clearLine: true });
             assistantBubble.write(chunk);
           },
@@ -361,12 +488,12 @@ export async function startRepl(
           }
         };
 
-        stdout.write("\n");
+        writeChat(persistentStatusArea, stdout, "\n");
         const result = await executeTurn(
           {
             conversationMessages: chatHistory,
             cwd: options.cwd,
-            instruction: input,
+            instruction: effectiveInput,
             profileSettings: resolveReplModelProfile(currentSelection)
           },
           {
@@ -395,7 +522,7 @@ export async function startRepl(
 
         if (currentTurnController.signal.aborted) {
           assistantBubble.end();
-          stdout.write(`${t("repl.interrupted", lang)}\n`);
+          writeChat(persistentStatusArea, stdout, `${t("repl.interrupted", lang)}\n`);
           currentTurnController = null;
           syncPrompt();
           if (!isClosed) readline.prompt();
@@ -404,16 +531,17 @@ export async function startRepl(
 
         if (streamedContent.trim().length === 0 && result.parsedResponse.files.length === 0 && result.parsedResponse.summary.trim().length > 0) {
           assistantBubble.write(result.parsedResponse.summary);
+          visibleAssistantMessage = result.parsedResponse.summary;
         }
         assistantBubble.end();
 
-        stdout.write("\n");
+        writeChat(persistentStatusArea, stdout, "\n");
         lastReasoningTrace = streamedReasoning.trim();
         lastTurnUsage = result.usage;
         lastTurnUsageProfile = { ...currentSelection };
 
         if (lastReasoningTrace.length > 0) {
-          stdout.write(`${t("repl.thoughts.hidden", lang)}\n`);
+          writeChat(persistentStatusArea, stdout, `${t("repl.thoughts.hidden", lang)}\n`);
         }
 
         if (result.usage) {
@@ -421,26 +549,32 @@ export async function startRepl(
           sessionUsage.turnCount += 1;
           sessionUsage.usage = addUsage(sessionUsage.usage, result.usage);
           sessionUsage.estimatedCostUsd += estimateUsageCost(currentSelection.model, result.usage);
-          stdout.write(`${formatUsageSummaryLine(currentSelection, result.usage)}\n`);
+          writeChat(persistentStatusArea, stdout, `${formatUsageSummaryLine(currentSelection, result.usage)}\n`);
         }
 
         chatHistory = result.conversationMessages;
+        if (visibleAssistantMessage.trim().length > 0) {
+          displayHistory = [...displayHistory, { role: "assistant", content: visibleAssistantMessage }];
+        }
 
         const hasChanges = result.parsedResponse.files.length > 0 || result.toolMutations.length > 0;
 
         if (hasChanges) {
+          const confirmOutput = persistentStatusArea
+            ? createChatPanelWriter(persistentStatusArea, stdout)
+            : stdout;
           const confirmed = await confirmExec(result, {
             input: stdin,
-            output: stdout,
+            output: confirmOutput,
             lang
           }, readline);
 
           if (confirmed) {
-            const prepared = buildPreparedFromReplResult(result, input, resolveReplModelProfile(currentSelection));
+            const prepared = buildPreparedFromReplResult(result, effectiveInput, resolveReplModelProfile(currentSelection));
             await executeApply(options.cwd, prepared, dependencies);
-            stdout.write(t("confirm.accepted", lang) + "\n");
+            writeChat(persistentStatusArea, stdout, t("confirm.accepted", lang) + "\n");
           } else {
-            stdout.write(t("confirm.rejected", lang) + "\n");
+            writeChat(persistentStatusArea, stdout, t("confirm.rejected", lang) + "\n");
           }
         }
 
@@ -467,19 +601,21 @@ export async function startRepl(
 
         store = persistedStore;
         updateChatHistory(options.cwd, store.currentSessionId, chatHistory);
+        updateDisplayHistory(options.cwd, store.currentSessionId, displayHistory);
         store = loadContextStore(options.cwd);
         currentTurnController = null;
       } catch (error) {
         const wasInterrupted = currentTurnController?.signal.aborted === true;
         currentTurnController = null;
-        // Ensure the transient thinking line does not linger on screen.
+        thinkingStatus.stop();
         clearTransientLine(stdout);
 
         if (wasInterrupted) {
           assistantBubble.end();
-          stdout.write(`${t("repl.interrupted", lang)}\n`);
+          writeChat(persistentStatusArea, stdout, `${t("repl.interrupted", lang)}\n`);
         } else {
-          stderr.write(renderPanelMessage(t("repl.panel.error", lang), `${t("error.prefix", lang)} ${formatError(error, lang)}`));
+          const errorMsg = renderPanelMessage(t("repl.panel.error", lang), `${t("error.prefix", lang)} ${formatError(error, lang)}`);
+          writeChat(persistentStatusArea, stderr, errorMsg);
         }
       }
 
@@ -487,9 +623,13 @@ export async function startRepl(
       if (!isClosed) readline.prompt();
     }
   } finally {
+    process.stdout.off("resize", onResize);
+
+    const shouldClearViewport = exitReason === "interrupt" || exitReason === "quit";
+
     if (persistentStatusArea) {
-      persistentStatusArea.dispose({ clearViewport: exitReason === "interrupt" });
-    } else if (exitReason === "interrupt") {
+      persistentStatusArea.dispose({ clearViewport: shouldClearViewport });
+    } else if (shouldClearViewport) {
       clearInteractiveViewport(stdout);
     }
     readline.close();
@@ -500,57 +640,6 @@ export async function startRepl(
   } else if (exitReason === "quit") {
     stdout.write(t("repl.goodbye", lang) + "\n");
   }
-}
-
-async function maybeInitializeRepository(options: {
-  cwd: string;
-  inspectRepository: typeof inspectRepository;
-  initializeRepository: typeof initializeRepository;
-  lang: Language;
-  output: NodeJS.WritableStream;
-  readline: Interface;
-}): Promise<{ isDirty: boolean; isRepository: boolean } | null> {
-  const answer = (await options.readline.question(t("repl.repo_init.prompt", options.lang))).trim().toLowerCase();
-
-  if (answer === "n" || answer === "no") {
-    options.output.write(renderPanelMessage(t("repl.panel.workspace", options.lang), t("repl.repo_init.declined", options.lang)));
-    return null;
-  }
-
-  if (!(answer === "y" || answer === "yes" || answer.length === 0)) {
-    options.output.write(renderPanelMessage(t("repl.panel.workspace", options.lang), t("repl.repo_init.declined", options.lang)));
-    return null;
-  }
-
-  try {
-    const repositoryState = await options.initializeRepository(options.cwd);
-    options.output.write(renderPanelMessage(t("repl.panel.workspace", options.lang), t("repl.repo_init.done", options.lang)));
-    return repositoryState;
-  } catch (error) {
-    options.output.write(
-      renderPanelMessage(
-        t("repl.panel.workspace", options.lang),
-        t("repl.repo_init.failed", options.lang, { message: formatError(error, options.lang) })
-      )
-    );
-    return await options.inspectRepository(options.cwd);
-  }
-}
-
-function looksLikeEngineeringIntent(input: string): boolean {
-  const normalized = input.trim().toLowerCase();
-
-  if (normalized.length === 0) {
-    return false;
-  }
-
-  const patterns = [
-    /\b(implement|build|create|scaffold|generate|write|edit|modify|refactor|fix|patch|add|remove|rename)\b/u,
-    /\b(api|endpoint|project|app|feature|module|component|test|tests|bug|code|file|files|repository|repo)\b/u,
-    /(瀹炵幇|缂栧啓|淇敼|閲嶆瀯|淇|鍒涘缓|鏂板缓|鎼缓|鐢熸垚|娣诲姞|鍒犻櫎|閲嶅懡鍚峾鎺ュ彛|椤圭洰|鍔熻兘|妯″潡|缁勪欢|娴嬭瘯|浠ｇ爜|鏂囦欢|浠撳簱)/u
-  ];
-
-  return patterns.some((pattern) => pattern.test(normalized));
 }
 
 function formatExecutionProfileStatus(selection: ReplProfileSelection): string {

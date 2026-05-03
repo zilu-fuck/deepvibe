@@ -3,6 +3,7 @@ import type { Interface } from "node:readline/promises";
 
 import {
   loadChatHistory,
+  loadDisplayHistory,
   loadContextStore,
   listSessions,
   startNewSession,
@@ -17,6 +18,7 @@ import {
 } from "./model-profile.js";
 import type { PersistentStatusArea } from "./status.js";
 import { renderPanelText } from "./status.js";
+import { ANSI, visibleWidth, wrapLine } from "./tui-layout.js";
 import { formatUsageDetails, type SessionUsageSnapshot } from "./usage.js";
 
 export interface SlashCommandContext {
@@ -34,6 +36,8 @@ export interface SlashCommandContext {
   setStore: (store: ReturnType<typeof loadContextStore>) => void;
   getChatHistory: () => ChatMessage[];
   setChatHistory: (history: ChatMessage[]) => void;
+  getDisplayHistory: () => ChatMessage[];
+  setDisplayHistory: (history: ChatMessage[]) => void;
   getLastReasoningTrace: () => string;
   getLastTurnUsage: () => DeepSeekUsage | null;
   getLastTurnUsageProfile: () => ReplProfileSelection;
@@ -41,6 +45,14 @@ export interface SlashCommandContext {
   getSessionUsage: () => SessionUsageSnapshot;
   setProfile: (profile: ReplProfileSelection) => void;
   startMultilineCapture: () => void;
+}
+
+function writeChat(ctx: SlashCommandContext, text: string): void {
+  if (ctx.persistentStatusArea) {
+    ctx.persistentStatusArea.writeChatRaw(text);
+  } else {
+    ctx.stdout.write(text);
+  }
 }
 
 export async function handleSlashCommand(
@@ -55,7 +67,7 @@ export async function handleSlashCommand(
       return "quit";
 
     case "/help":
-      ctx.stdout.write(renderPanelText(t("repl.panel.commands", ctx.lang), [
+      writeChat(ctx, renderPanelText(t("repl.panel.commands", ctx.lang), [
         t("cmd.help.title", ctx.lang),
         t("cmd.help.new", ctx.lang),
         t("cmd.help.history", ctx.lang),
@@ -76,29 +88,33 @@ export async function handleSlashCommand(
       const nextStore = startNewSession(ctx.cwd);
       ctx.setStore(nextStore);
       ctx.setChatHistory([]);
+      ctx.setDisplayHistory([]);
       ctx.refreshStatusPanel();
-      ctx.stdout.write(t("cmd.new.started", ctx.lang) + "\n");
+      writeChat(ctx, t("cmd.new.started", ctx.lang) + "\n");
       return;
     }
 
     case "/history": {
-      const history = ctx.getChatHistory();
+      const history = ctx.getDisplayHistory();
 
       if (history.length === 0) {
-        ctx.stdout.write(t("cmd.history.empty", ctx.lang) + "\n");
+        writeChat(ctx, t("cmd.history.empty", ctx.lang) + "\n");
         return;
       }
 
-      for (const msg of history) {
-        if (msg.role === "user") {
-          const content = typeof msg.content === "string" ? msg.content : "";
-          const preview = content.length > 120 ? `${content.slice(0, 120)}...` : content;
-          ctx.stdout.write(`  user: ${preview}\n`);
-        } else if (msg.role === "assistant") {
-          const content = typeof msg.content === "string" ? msg.content : "";
-          const preview = content.length > 120 ? `${content.slice(0, 120)}...` : content;
-          ctx.stdout.write(`  assistant: ${preview}\n`);
-        }
+      ctx.persistentStatusArea?.suspend();
+      try {
+        await openScrollableTextViewer({
+          title: t("repl.history.title", ctx.lang),
+          body: formatConversationHistory(history, ctx.lang),
+          returnPrompt: t("repl.thoughts.return", ctx.lang),
+          lang: ctx.lang,
+          input: ctx.input,
+          output: ctx.stdout,
+          readline: ctx.readline
+        });
+      } finally {
+        ctx.persistentStatusArea?.resume();
       }
       return;
     }
@@ -107,13 +123,13 @@ export async function handleSlashCommand(
       const sessions = listSessions(ctx.getStore());
 
       if (sessions.length === 0) {
-        ctx.stdout.write(t("cmd.sessions.empty", ctx.lang) + "\n");
+        writeChat(ctx, t("cmd.sessions.empty", ctx.lang) + "\n");
         return;
       }
 
       for (const session of sessions) {
         const active = session.id === ctx.getStore().currentSessionId ? ` (${t("cmd.sessions.active", ctx.lang)})` : "";
-        ctx.stdout.write(`  ${session.id}${active} - ${session.turnCount} ${t("cmd.sessions.turns", ctx.lang)}, ${t("cmd.sessions.last", ctx.lang)} ${session.updatedAt}\n`);
+        writeChat(ctx, `  ${session.id}${active} - ${session.turnCount} ${t("cmd.sessions.turns", ctx.lang)}, ${t("cmd.sessions.last", ctx.lang)} ${session.updatedAt}\n`);
       }
       return;
     }
@@ -122,21 +138,22 @@ export async function handleSlashCommand(
       const sessionId = args[0];
 
       if (!sessionId) {
-        ctx.stdout.write(t("cmd.switch.usage", ctx.lang) + "\n");
+        writeChat(ctx, t("cmd.switch.usage", ctx.lang) + "\n");
         return;
       }
 
       const nextStore = switchSession(ctx.cwd, sessionId);
 
       if (!nextStore) {
-        ctx.stdout.write(`${t("cmd.switch.not_found", ctx.lang)} ${sessionId}\n`);
+        writeChat(ctx, `${t("cmd.switch.not_found", ctx.lang)} ${sessionId}\n`);
         return;
       }
 
       ctx.setStore(nextStore);
       ctx.setChatHistory(loadChatHistory(nextStore));
+      ctx.setDisplayHistory(loadDisplayHistory(nextStore));
       ctx.refreshStatusPanel();
-      ctx.stdout.write(`${t("cmd.switch.done", ctx.lang)} ${sessionId}\n`);
+      writeChat(ctx, `${t("cmd.switch.done", ctx.lang)} ${sessionId}\n`);
       return;
     }
 
@@ -144,8 +161,8 @@ export async function handleSlashCommand(
       const requestedProfile = parseExecutionProfile(args[0]);
 
       if (args[0] && !requestedProfile) {
-        ctx.stdout.write(t("cmd.effect.invalid", ctx.lang, { value: args[0] }) + "\n");
-        ctx.stdout.write(t("cmd.effect.usage", ctx.lang) + "\n");
+        writeChat(ctx, t("cmd.effect.invalid", ctx.lang, { value: args[0] }) + "\n");
+        writeChat(ctx, t("cmd.effect.usage", ctx.lang) + "\n");
         return;
       }
 
@@ -158,7 +175,7 @@ export async function handleSlashCommand(
       ctx.refreshStatusPanel();
 
       const profile = resolveReplModelProfile(nextSelection);
-      ctx.stdout.write(
+      writeChat(ctx,
         t("cmd.effect.changed", ctx.lang, {
           profile: nextSelection.effect,
           model: profile.model,
@@ -172,8 +189,8 @@ export async function handleSlashCommand(
       const requestedModel = parseExecutionModel(args[0]);
 
       if (args[0] && !requestedModel) {
-        ctx.stdout.write(t("cmd.model.invalid", ctx.lang, { value: args[0] }) + "\n");
-        ctx.stdout.write(t("cmd.model.usage", ctx.lang) + "\n");
+        writeChat(ctx, t("cmd.model.invalid", ctx.lang, { value: args[0] }) + "\n");
+        writeChat(ctx, t("cmd.model.usage", ctx.lang) + "\n");
         return;
       }
 
@@ -183,7 +200,7 @@ export async function handleSlashCommand(
       ctx.refreshStatusPanel();
 
       const profile = resolveReplModelProfile(nextProfile);
-      ctx.stdout.write(
+      writeChat(ctx,
         t("cmd.model.changed", ctx.lang, {
           model: nextModel,
           profile: nextProfile.effect,
@@ -199,11 +216,11 @@ export async function handleSlashCommand(
       const latestProfile = ctx.getLastTurnUsageProfile();
 
       if (!sessionUsage.usage) {
-        ctx.stdout.write(t("cmd.cost.empty", ctx.lang) + "\n");
+        writeChat(ctx, t("cmd.cost.empty", ctx.lang) + "\n");
         return;
       }
 
-      ctx.stdout.write(
+      writeChat(ctx,
         renderPanelText(t("cmd.cost.title", ctx.lang), [
           `${t("repl.status.session", ctx.lang)}: ${ctx.getStore().currentSessionId}`,
           `${t("cmd.cost.turns", ctx.lang)}: ${sessionUsage.turnCount}`,
@@ -216,20 +233,28 @@ export async function handleSlashCommand(
 
     case "/multiline":
       ctx.startMultilineCapture();
-      ctx.stdout.write(t("cmd.multiline.started", ctx.lang) + "\n");
+      writeChat(ctx, t("cmd.multiline.started", ctx.lang) + "\n");
       return;
 
     case "/thoughts": {
       const trace = ctx.getLastReasoningTrace();
 
       if (trace.trim().length === 0) {
-        ctx.stdout.write(`${t("repl.thoughts.empty", ctx.lang)}\n`);
+        writeChat(ctx, `${t("repl.thoughts.empty", ctx.lang)}\n`);
         return;
       }
 
       ctx.persistentStatusArea?.suspend();
       try {
-        await openThoughtTraceViewer(trace, ctx.lang, ctx.input, ctx.stdout, ctx.readline);
+        await openScrollableTextViewer({
+          title: t("repl.thoughts.title", ctx.lang),
+          body: trace,
+          returnPrompt: t("repl.thoughts.return", ctx.lang),
+          lang: ctx.lang,
+          input: ctx.input,
+          output: ctx.stdout,
+          readline: ctx.readline
+        });
       } finally {
         ctx.persistentStatusArea?.resume();
       }
@@ -250,7 +275,7 @@ export async function handleSlashCommand(
       return;
 
     default:
-      ctx.stdout.write(t("cmd.unknown", ctx.lang, { command }) + "\n");
+      writeChat(ctx, t("cmd.unknown", ctx.lang, { command }) + "\n");
   }
 }
 
@@ -294,71 +319,353 @@ export function completeReplInput(line: string, options: { sessionIds: string[] 
   return [commands.filter((command) => command.startsWith(trimmedStart)), trimmedStart];
 }
 
-async function openThoughtTraceViewer(
-  trace: string,
-  lang: Language,
-  input: NodeJS.ReadableStream,
-  output: NodeJS.WritableStream,
-  readline: Interface
-): Promise<void> {
-  const useAltScreen = (output as NodeJS.WritableStream & { isTTY?: boolean }).isTTY === true;
+function formatConversationHistory(history: ChatMessage[], lang: Language): string {
+  const sections: string[] = [];
+  let visibleEntryCount = 0;
 
-  if (useAltScreen) {
-    output.write("\x1B[?1049h\x1B[2J\x1B[H");
+  for (const msg of history) {
+    if (msg.role !== "user" && msg.role !== "assistant") {
+      continue;
+    }
+
+    visibleEntryCount += 1;
+    const title = msg.role === "user" ? t("repl.panel.user", lang) : t("repl.panel.assistant", lang);
+    const heading = `${title} ${visibleEntryCount}`;
+    const content = (typeof msg.content === "string" ? msg.content : "") || "";
+
+    sections.push(heading);
+    sections.push("-".repeat(Math.max(12, visibleWidth(heading))));
+    sections.push(content);
+    sections.push("");
   }
 
-  output.write(`${t("repl.thoughts.title", lang)}\n`);
-  output.write(`${"=".repeat(48)}\n\n`);
-  output.write(`${trace}\n\n`);
-  await waitForThoughtViewerExit(input, output, readline, lang);
-
-  if (useAltScreen) {
-    output.write("\x1B[?1049l");
-  }
+  return sections.join("\n").trimEnd();
 }
 
-async function waitForThoughtViewerExit(
-  input: NodeJS.ReadableStream,
-  output: NodeJS.WritableStream,
-  readline: Interface,
-  lang: Language
-): Promise<void> {
-  const rawInput = input as NodeJS.ReadableStream & {
+async function openScrollableTextViewer(options: {
+  title: string;
+  body: string;
+  returnPrompt: string;
+  lang: Language;
+  input: NodeJS.ReadableStream;
+  output: NodeJS.WritableStream;
+  readline: Interface;
+}): Promise<void> {
+  const ttyOutput = options.output as NodeJS.WritableStream & {
+    columns?: number;
+    isTTY?: boolean;
+    off?: (eventName: string, listener: (...args: never[]) => void) => void;
+    on?: (eventName: string, listener: (...args: never[]) => void) => void;
+    rows?: number;
+  };
+  const useAltScreen = ttyOutput.isTTY === true;
+  const rawInput = options.input as NodeJS.ReadableStream & {
+    addListener?: (eventName: string, listener: (...args: never[]) => void) => void;
+    off?: (eventName: string, listener: (...args: never[]) => void) => void;
+    listeners?: (eventName: string) => Array<(...args: never[]) => void>;
+    on?: (eventName: string, listener: (...args: never[]) => void) => void;
+    removeListener?: (eventName: string, listener: (...args: never[]) => void) => void;
     isTTY?: boolean;
     setRawMode?: (mode: boolean) => void;
   };
+  let mouseTrackingEnabled = false;
 
-  if (rawInput.isTTY && typeof rawInput.setRawMode === "function") {
-    emitKeypressEvents(input);
-    rawInput.setRawMode(true);
-    output.write(`${t("repl.thoughts.return", lang)} `);
-
-    try {
-      await new Promise<void>((resolve) => {
-        const onKeypress = (_str: string, key: { name?: string; sequence?: string }) => {
-          const isReturn = key.name === "return" || key.name === "enter";
-          const isQuit = key.name === "q" || key.sequence?.toLowerCase() === "q";
-          const isEscape = key.name === "escape" || key.sequence === "\u001b";
-
-          if (!isReturn && !isQuit && !isEscape) {
-            return;
-          }
-
-          input.off("keypress", onKeypress);
-          output.write("\n");
-          resolve();
-        };
-
-        input.on("keypress", onKeypress);
-      });
-    } finally {
-      rawInput.setRawMode(false);
-    }
-
-    return;
+  if (useAltScreen) {
+    options.output.write("\x1B[?1049h");
   }
 
-  await readline.question(`${t("repl.thoughts.return", lang)} `);
+  try {
+    if (rawInput.isTTY && typeof rawInput.setRawMode === "function") {
+      const logicalLines = options.body.replace(/\r\n/g, "\n").split("\n");
+      let scrollTop = 0;
+      let wrappedWidth = getViewerContentWidth(Math.max(ttyOutput.columns ?? 80, 20));
+      let wrappedLines = wrapViewerLines(logicalLines, wrappedWidth);
+      let pendingMouseSequence = "";
+      const suspendedKeypressListeners = [...(rawInput.listeners?.("keypress") ?? [])] as Array<(...args: never[]) => void>;
+
+      emitKeypressEvents(options.input);
+      for (const listener of suspendedKeypressListeners) {
+        rawInput.removeListener?.("keypress", listener);
+      }
+      mouseTrackingEnabled = true;
+      options.output.write("\x1B[?1000h\x1B[?1006h");
+      rawInput.setRawMode(true);
+
+      const render = () => {
+        const termCols = Math.max(ttyOutput.columns ?? 80, 20);
+        const termRows = Math.max(ttyOutput.rows ?? 24, 8);
+        const contentHeight = Math.max(termRows - 3, 1);
+        const contentWidth = getViewerContentWidth(termCols);
+        if (contentWidth !== wrappedWidth) {
+          wrappedWidth = contentWidth;
+          wrappedLines = wrapViewerLines(logicalLines, wrappedWidth);
+        }
+        const maxScrollTop = Math.max(0, wrappedLines.length - contentHeight);
+        scrollTop = Math.min(scrollTop, maxScrollTop);
+
+        const visibleEnd = Math.min(scrollTop + contentHeight, wrappedLines.length);
+        const position = `${scrollTop + 1}-${visibleEnd}/${wrappedLines.length}`;
+        const controls = fitViewerLine(`${position} | ${t("repl.viewer.controls", options.lang)}`, termCols);
+        const scrollbar = renderViewerScrollbar({
+          contentHeight,
+          currentScrollTop: scrollTop,
+          totalLines: wrappedLines.length
+        });
+
+        options.output.write(ANSI.clearScreen);
+        options.output.write(`${options.title}\n`);
+        options.output.write(`${controls}\n`);
+        options.output.write(`${"=".repeat(Math.max(16, Math.min(termCols, 48)))}\n`);
+
+        for (let index = scrollTop; index < visibleEnd; index += 1) {
+          const scrollbarChar = scrollbar[index - scrollTop] ?? " ";
+          options.output.write(`${renderViewerContentLine(wrappedLines[index] ?? "", contentWidth, scrollbarChar)}\n`);
+        }
+      };
+
+      const onResize = () => {
+        render();
+      };
+
+      if (useAltScreen && typeof ttyOutput.on === "function") {
+        ttyOutput.on("resize", onResize);
+      }
+
+      try {
+        render();
+        await new Promise<void>((resolve) => {
+          const onData = (chunk: Buffer | string) => {
+            const next = consumeViewerMouseInput(`${pendingMouseSequence}${typeof chunk === "string" ? chunk : chunk.toString("utf8")}`);
+            pendingMouseSequence = next.remainder;
+
+            if (!next.scroll) {
+              return;
+            }
+
+            const contentHeight = Math.max((ttyOutput.rows ?? 24) - 3, 1);
+            const maxScrollTop = Math.max(0, wrappedLines.length - contentHeight);
+            scrollTop = next.scroll.direction === "up"
+              ? Math.max(0, scrollTop - next.scroll.lines)
+              : Math.min(maxScrollTop, scrollTop + next.scroll.lines);
+            render();
+          };
+
+          const onKeypress = (_str: string, key: { name?: string; sequence?: string }) => {
+            const sequence = key.sequence?.toLowerCase();
+            const isReturn = key.name === "return" || key.name === "enter";
+            const isQuit = key.name === "q" || sequence === "q";
+            const isEscape = key.name === "escape" || key.sequence === "\u001b";
+
+            if (isReturn || isQuit || isEscape) {
+              options.input.off("keypress", onKeypress);
+              rawInput.off?.("data", onData);
+              resolve();
+              return;
+            }
+
+            const nextScrollTop = getNextViewerScrollTop({
+              contentHeight: Math.max((ttyOutput.rows ?? 24) - 3, 1),
+              currentScrollTop: scrollTop,
+              key,
+              totalLines: wrappedLines.length
+            });
+
+            if (nextScrollTop === null || nextScrollTop === scrollTop) {
+              return;
+            }
+
+            scrollTop = nextScrollTop;
+            render();
+          };
+
+          options.input.on("keypress", onKeypress);
+          rawInput.on?.("data", onData);
+        });
+      } finally {
+        if (useAltScreen && typeof ttyOutput.off === "function") {
+          ttyOutput.off("resize", onResize);
+        }
+        rawInput.setRawMode(false);
+        for (const listener of suspendedKeypressListeners) {
+          rawInput.addListener?.("keypress", listener);
+        }
+      }
+
+      return;
+    }
+
+    if (useAltScreen) {
+      options.output.write(ANSI.clearScreen);
+    }
+
+    options.output.write(`${options.title}\n`);
+    options.output.write(`${"=".repeat(48)}\n\n`);
+    options.output.write(`${options.body}\n\n`);
+    options.output.write(`${options.returnPrompt}\n`);
+  } finally {
+    if (mouseTrackingEnabled) {
+      options.output.write("\x1B[?1000l\x1B[?1006l");
+    }
+
+    if (useAltScreen) {
+      options.output.write("\x1B[?1049l");
+    }
+  }
+}
+
+function consumeViewerMouseInput(value: string): {
+  remainder: string;
+  scroll: { direction: "up" | "down"; lines: number } | null;
+} {
+  let remainder = "";
+  let scroll: { direction: "up" | "down"; lines: number } | null = null;
+  let cursor = 0;
+
+  while (cursor < value.length) {
+    const start = value.indexOf("\x1B[<", cursor);
+
+    if (start === -1) {
+      const trailingEscape = findTrailingMousePrefix(value.slice(cursor));
+      remainder = trailingEscape ?? "";
+      break;
+    }
+
+    const candidate = value.slice(start);
+    const match = candidate.match(/^\x1B\[<(\d+);(\d+);(\d+)([mM])/u);
+
+    if (match) {
+      const parsed = parseMouseScrollReport(Number(match[1]));
+      if (parsed) {
+        scroll = parsed;
+      }
+      cursor = start + match[0].length;
+      continue;
+    }
+
+    if (isIncompleteMouseSequence(candidate)) {
+      remainder = candidate;
+      break;
+    }
+
+    cursor = start + 1;
+  }
+
+  return { remainder, scroll };
+}
+
+function parseMouseScrollReport(button: number): { direction: "up" | "down"; lines: number } | null {
+  const lines = 3;
+
+  if (button === 64) {
+    return { direction: "up", lines };
+  }
+
+  if (button === 65) {
+    return { direction: "down", lines };
+  }
+
+  return null;
+}
+
+function isIncompleteMouseSequence(value: string): boolean {
+  return /^\x1B\[<[\d;]*$/u.test(value) || value === "\x1B" || value === "\x1B[";
+}
+
+function findTrailingMousePrefix(value: string): string | null {
+  for (const prefix of ["\x1B[<", "\x1B[", "\x1B"]) {
+    const index = value.lastIndexOf(prefix);
+    if (index !== -1 && isIncompleteMouseSequence(value.slice(index))) {
+      return value.slice(index);
+    }
+  }
+
+  return null;
+}
+
+function wrapViewerLines(lines: string[], width: number): string[] {
+  const wrappedLines: string[] = [];
+
+  for (const line of lines) {
+    const wrapped = wrapLine(line, width);
+    wrappedLines.push(...(wrapped.length > 0 ? wrapped : [""]));
+  }
+
+  return wrappedLines.length > 0 ? wrappedLines : [""];
+}
+
+function getViewerContentWidth(termCols: number): number {
+  return Math.max(termCols - 1, 10);
+}
+
+function renderViewerContentLine(text: string, width: number, scrollbarChar: string): string {
+  const padding = Math.max(0, width - visibleWidth(text));
+  return `${text}${" ".repeat(padding)}${scrollbarChar}`;
+}
+
+function renderViewerScrollbar(options: {
+  contentHeight: number;
+  currentScrollTop: number;
+  totalLines: number;
+}): string[] {
+  if (options.totalLines <= options.contentHeight) {
+    return Array.from({ length: options.contentHeight }, () => " ");
+  }
+
+  const track = Array.from({ length: options.contentHeight }, () => ".");
+  const maxScrollTop = Math.max(0, options.totalLines - options.contentHeight);
+  const thumbSize = Math.max(1, Math.round((options.contentHeight / options.totalLines) * options.contentHeight));
+  const thumbTravel = Math.max(0, options.contentHeight - thumbSize);
+  const thumbStart = maxScrollTop === 0
+    ? 0
+    : Math.round((options.currentScrollTop / maxScrollTop) * thumbTravel);
+
+  for (let index = thumbStart; index < thumbStart + thumbSize; index += 1) {
+    track[index] = "#";
+  }
+
+  return track;
+}
+
+function fitViewerLine(text: string, width: number): string {
+  const wrapped = wrapLine(text, width);
+  return wrapped[0] ?? "";
+}
+
+function getNextViewerScrollTop(options: {
+  contentHeight: number;
+  currentScrollTop: number;
+  key: { name?: string; sequence?: string };
+  totalLines: number;
+}): number | null {
+  const maxScrollTop = Math.max(0, options.totalLines - options.contentHeight);
+  const pageSize = Math.max(options.contentHeight - 1, 1);
+  const sequence = options.key.sequence?.toLowerCase();
+
+  if (options.key.name === "up" || options.key.name === "k" || sequence === "k") {
+    return Math.max(0, options.currentScrollTop - 1);
+  }
+
+  if (options.key.name === "down" || options.key.name === "j" || sequence === "j") {
+    return Math.min(maxScrollTop, options.currentScrollTop + 1);
+  }
+
+  if (options.key.name === "pageup") {
+    return Math.max(0, options.currentScrollTop - pageSize);
+  }
+
+  if (options.key.name === "pagedown" || options.key.name === "space" || sequence === " ") {
+    return Math.min(maxScrollTop, options.currentScrollTop + pageSize);
+  }
+
+  if (options.key.name === "home") {
+    return 0;
+  }
+
+  if (options.key.name === "end") {
+    return maxScrollTop;
+  }
+
+  return null;
 }
 
 function parseExecutionProfile(value?: string): ReplReasoningEffect | undefined {
@@ -415,3 +722,4 @@ function setExecutionModel(selection: ReplProfileSelection, model: "flash" | "pr
     model: model === "flash" ? "deepseek-v4-flash" : "deepseek-v4-pro"
   };
 }
+

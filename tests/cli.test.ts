@@ -48,6 +48,7 @@ describe("runCli", () => {
     await runCli(["node", "deepvibe", "update api"], {
       applyPreparedExecution: vi.fn(),
       cwd: () => cwd,
+      detectEngineeringIntent: vi.fn().mockResolvedValue(readOnlyIntentDecision()),
       homeDir,
       prepareExecution: vi.fn().mockResolvedValue(createPreparedExecution()),
       stderr,
@@ -283,6 +284,7 @@ describe("runCli", () => {
     await runCli(["node", "deepvibe", "update api"], {
       applyPreparedExecution,
       cwd: () => cwd,
+      detectEngineeringIntent: vi.fn().mockResolvedValue(readOnlyIntentDecision()),
       homeDir,
       prepareWorkspaceAccess: vi.fn().mockResolvedValue({
         requestedCwd: cwd,
@@ -305,6 +307,98 @@ describe("runCli", () => {
     expect(output).toContain("Planned changes: 1 file(s)");
     expect(output).toContain("--- MODIFY src/api.ts ---");
     expect(applyPreparedExecution).toHaveBeenCalledTimes(1);
+  });
+
+  it("prompts to initialize a repository for one-shot write requests and auto-enables plan mode", async () => {
+    const cwd = createCliWorkspace({});
+    const homeDir = path.join(cwd, "home");
+    writeGlobalConfig(homeDir, { apiKey: "test-key" });
+    const stdout = createWritableStream(true);
+    const initializeRepository = vi.fn().mockResolvedValue({
+      isRepository: true,
+      isDirty: false,
+      currentHead: null
+    });
+    const generatePlan = vi.fn().mockResolvedValue({
+      plan: {
+        overview: "Bootstrap project",
+        steps: [
+          {
+            index: 1,
+            description: "Create starter files",
+            files: ["README.md"],
+            estimatedChanges: "1 file"
+          }
+        ],
+        notes: ""
+      }
+    });
+    const applyPreparedExecution = vi.fn().mockResolvedValue({
+      message: "Applied plan step"
+    });
+
+    await runCli(["node", "deepvibe", "build a new cli project"], {
+      applyPreparedExecution,
+      confirmPlanStep: vi.fn().mockResolvedValue(true),
+      cwd: () => cwd,
+      detectEngineeringIntent: vi.fn().mockResolvedValue(writeIntentDecision()),
+      generatePlan,
+      homeDir,
+      initializeRepository,
+      inspectRepository: vi.fn().mockResolvedValue({
+        isRepository: false,
+        isDirty: false,
+        currentHead: null
+      }),
+      prepareExecution: vi.fn().mockResolvedValue(createPreparedExecution()),
+      prepareWorkspaceAccess: vi.fn().mockResolvedValue({
+        requestedCwd: cwd,
+        effectiveCwd: cwd,
+        mode: "full"
+      }),
+      stderr: createWritableStream(true),
+      stdin: createInputStream("y\na\n", true),
+      stdout
+    });
+
+    expect(initializeRepository).toHaveBeenCalledWith(cwd);
+    expect(generatePlan).toHaveBeenCalledTimes(1);
+    expect(stdout.readAsString()).toContain("Auto-enabled plan mode for this write request.");
+    expect(stdout.readAsString()).toContain("Git repository initialized.");
+  });
+
+  it("runs verification after applying a write request", async () => {
+    const cwd = createCliWorkspace({});
+    const homeDir = path.join(cwd, "home");
+    writeGlobalConfig(homeDir, { apiKey: "test-key" });
+    const stdout = createWritableStream(false);
+    const verifyWrittenChanges = vi.fn().mockResolvedValue({
+      status: "passed",
+      steps: [
+        {
+          command: "pnpm test",
+          cwd: ".",
+          exitCode: 0,
+          label: "test",
+          stdout: "",
+          stderr: ""
+        }
+      ]
+    });
+
+    await runCli(["node", "deepvibe", "--force", "update api"], {
+      applyPreparedExecution: vi.fn().mockResolvedValue({ message: "Applied with force" }),
+      cwd: () => cwd,
+      homeDir,
+      prepareExecution: vi.fn().mockResolvedValue(createPreparedExecution()),
+      stderr: createWritableStream(false),
+      stdin: createInputStream("", false),
+      stdout,
+      verifyWrittenChanges
+    });
+
+    expect(verifyWrittenChanges).toHaveBeenCalledTimes(1);
+    expect(stdout.readAsString()).toContain("Verification passed: 1 command(s) ran.");
   });
 
   it("applies only the files selected during review", async () => {
@@ -704,4 +798,24 @@ function writeGlobalConfig(homeDir: string, contents: Record<string, unknown>): 
   const filePath = path.join(homeDir, ".deepvibe", "config.json");
   mkdirSync(path.dirname(filePath), { recursive: true });
   writeFileSync(filePath, JSON.stringify(contents, null, 2), "utf8");
+}
+
+function readOnlyIntentDecision() {
+  return {
+    engineeringIntent: false,
+    requiresWriteAccess: false,
+    confidence: "high" as const,
+    reason: "read-only",
+    source: "heuristic" as const
+  };
+}
+
+function writeIntentDecision() {
+  return {
+    engineeringIntent: true,
+    requiresWriteAccess: true,
+    confidence: "high" as const,
+    reason: "write request",
+    source: "model" as const
+  };
 }

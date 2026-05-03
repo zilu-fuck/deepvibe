@@ -69,6 +69,20 @@ export interface CreateCompletionOptions {
   tools?: ChatCompletionTool[];
 }
 
+export interface CreateFimCompletionOptions {
+  abortSignal?: AbortSignal;
+  echo?: boolean;
+  logprobs?: number;
+  maxTokens?: number;
+  model: "deepseek-v4-pro";
+  prompt: string;
+  stop?: string | string[];
+  stream?: boolean;
+  suffix?: string;
+  temperature?: number;
+  topP?: number;
+}
+
 export interface StreamingCallbacks {
   onContent?: (chunk: string) => void;
   onReasoningContent?: (chunk: string) => void;
@@ -92,6 +106,14 @@ export interface DeepSeekCompletionResult {
   usage: DeepSeekUsage | null;
 }
 
+export interface DeepSeekFimCompletionResult {
+  content: string;
+  finishReason: string | null;
+  id: string | null;
+  logprobs: Record<string, unknown> | null;
+  usage: DeepSeekUsage | null;
+}
+
 interface DeepSeekChunk {
   choices?: Array<{
     delta?: {
@@ -106,6 +128,16 @@ interface DeepSeekChunk {
       reasoning_content?: string | null;
       tool_calls?: ChatCompletionToolCall[];
     };
+  }>;
+  id?: string;
+  usage?: DeepSeekUsage | null;
+}
+
+interface DeepSeekTextCompletionChunk {
+  choices?: Array<{
+    finish_reason?: string | null;
+    logprobs?: Record<string, unknown> | null;
+    text?: string | null;
   }>;
   id?: string;
   usage?: DeepSeekUsage | null;
@@ -263,6 +295,66 @@ export class DeepSeekClient {
       }
     }
   }
+
+  async createFimCompletion(
+    options: CreateFimCompletionOptions
+  ): Promise<DeepSeekFimCompletionResult> {
+    let attempt = 0;
+
+    while (true) {
+      const controller = new AbortController();
+      const abortHandler = () => controller.abort();
+      options.abortSignal?.addEventListener("abort", abortHandler, { once: true });
+      const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+
+      try {
+        if (options.abortSignal?.aborted) {
+          throw new DeepSeekClientAbortError("FIM completion was aborted before the request was sent.");
+        }
+
+        const fimBaseUrl = this.baseUrl.endsWith("/beta") ? this.baseUrl : `${this.baseUrl}/beta`;
+        const response = await this.fetchFn(`${fimBaseUrl}/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(buildFimCompletionBody(options)),
+          signal: controller.signal
+        });
+
+        if (!response.ok) {
+          const error = new DeepSeekClientError(response.status, await response.text());
+
+          if (!isRetriableStatus(error.status) || attempt >= this.maxRetries) {
+            throw error;
+          }
+
+          await this.sleepFn(resolveRetryDelayMs(response, attempt, this.retryBaseDelayMs));
+          attempt += 1;
+          continue;
+        }
+
+        return options.stream
+          ? await readStreamingTextCompletionResponse(response)
+          : await readTextCompletionResponse(response);
+      } catch (error) {
+        if (options.abortSignal?.aborted) {
+          throw new DeepSeekClientAbortError("FIM completion was aborted.");
+        }
+
+        if (!isRetriableError(error) || attempt >= this.maxRetries) {
+          throw error;
+        }
+
+        await this.sleepFn(resolveExponentialDelayMs(attempt, this.retryBaseDelayMs));
+        attempt += 1;
+      } finally {
+        options.abortSignal?.removeEventListener("abort", abortHandler);
+        clearTimeout(timeoutId);
+      }
+    }
+  }
 }
 
 export function buildChatCompletionBody(
@@ -301,6 +393,50 @@ export function buildChatCompletionBody(
   return body;
 }
 
+export function buildFimCompletionBody(
+  options: CreateFimCompletionOptions
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: options.model,
+    prompt: options.prompt
+  };
+
+  if (options.echo !== undefined) {
+    body.echo = options.echo;
+  }
+
+  if (options.logprobs !== undefined) {
+    body.logprobs = options.logprobs;
+  }
+
+  if (options.maxTokens !== undefined) {
+    body.max_tokens = options.maxTokens;
+  }
+
+  if (options.stop !== undefined) {
+    body.stop = options.stop;
+  }
+
+  if (options.stream) {
+    body.stream = true;
+    body.stream_options = { include_usage: true };
+  }
+
+  if (options.suffix !== undefined) {
+    body.suffix = options.suffix;
+  }
+
+  if (options.temperature !== undefined) {
+    body.temperature = options.temperature;
+  }
+
+  if (options.topP !== undefined) {
+    body.top_p = options.topP;
+  }
+
+  return body;
+}
+
 async function readJsonResponse(response: Response): Promise<DeepSeekCompletionResult> {
   const json = (await response.json()) as DeepSeekChunk;
   const choice = json.choices?.[0];
@@ -311,6 +447,19 @@ async function readJsonResponse(response: Response): Promise<DeepSeekCompletionR
     reasoningContent: choice?.message?.reasoning_content ?? "",
     finishReason: choice?.finish_reason ?? null,
     toolCalls: choice?.message?.tool_calls ?? [],
+    usage: json.usage ?? null
+  };
+}
+
+async function readTextCompletionResponse(response: Response): Promise<DeepSeekFimCompletionResult> {
+  const json = (await response.json()) as DeepSeekTextCompletionChunk;
+  const choice = json.choices?.[0];
+
+  return {
+    id: json.id ?? null,
+    content: choice?.text ?? "",
+    finishReason: choice?.finish_reason ?? null,
+    logprobs: choice?.logprobs ?? null,
     usage: json.usage ?? null
   };
 }
@@ -394,6 +543,111 @@ async function readStreamingResponse(response: Response): Promise<DeepSeekComple
     reasoningContent,
     finishReason,
     toolCalls,
+    usage
+  };
+}
+
+async function readStreamingTextCompletionResponse(response: Response): Promise<DeepSeekFimCompletionResult> {
+  if (!response.body) {
+    throw new DeepSeekClientError(response.status, "Streaming response body is missing.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let content = "";
+  let finishReason: string | null = null;
+  let id: string | null = null;
+  let usage: DeepSeekUsage | null = null;
+  let logprobs: Record<string, unknown> | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+
+    while (true) {
+      const boundary = buffer.indexOf("\n\n");
+
+      if (boundary === -1) {
+        break;
+      }
+
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const data = extractEventData(rawEvent);
+
+      if (!data) {
+        continue;
+      }
+
+      if (data === "[DONE]") {
+        return {
+          id,
+          content,
+          finishReason,
+          logprobs,
+          usage
+        };
+      }
+
+      const chunk = JSON.parse(data) as DeepSeekTextCompletionChunk;
+      id = chunk.id ?? id;
+      usage = chunk.usage ?? usage;
+      const choice = chunk.choices?.[0];
+
+      if (!choice) {
+        continue;
+      }
+
+      if (choice.text) {
+        content += choice.text;
+      }
+
+      if (choice.logprobs) {
+        logprobs = choice.logprobs;
+      }
+
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
+    }
+  }
+
+  if (buffer.length > 0) {
+    const data = extractEventData(buffer);
+
+    if (data && data !== "[DONE]") {
+      const chunk = JSON.parse(data) as DeepSeekTextCompletionChunk;
+      id = chunk.id ?? id;
+      usage = chunk.usage ?? usage;
+      const choice = chunk.choices?.[0];
+
+      if (choice) {
+        if (choice.text) {
+          content += choice.text;
+        }
+
+        if (choice.logprobs) {
+          logprobs = choice.logprobs;
+        }
+
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+        }
+      }
+    }
+  }
+
+  return {
+    id,
+    content,
+    finishReason,
+    logprobs,
     usage
   };
 }

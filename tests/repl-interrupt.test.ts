@@ -135,11 +135,13 @@ function createWritableStream() {
   const stream = new PassThrough() as PassThrough & NodeJS.WritableStream & {
     isTTY?: boolean;
     rows?: number;
+    columns?: number;
     readAsString: () => string;
   };
 
   stream.isTTY = true;
   stream.rows = 24;
+  stream.columns = 80;
   stream.on("data", (chunk) => {
     buffer += chunk.toString("utf8");
   });

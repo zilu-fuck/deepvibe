@@ -1,4 +1,16 @@
+import { execFileSync } from "node:child_process";
+
 import { t, type Language } from "./i18n.js";
+import {
+  ANSI,
+  computeLayout,
+  renderBoxBottom,
+  renderBoxLine,
+  renderBoxTop,
+  visibleWidth,
+  wrapLine,
+  type TuiLayout
+} from "./tui-layout.js";
 
 export interface PersistentStatusArea {
   clearBody: () => void;
@@ -7,6 +19,12 @@ export interface PersistentStatusArea {
   refresh: () => void;
   resume: () => void;
   suspend: () => void;
+  writeChatLine: (text: string) => void;
+  writeChatRaw: (text: string) => void;
+  redrawInputPanel: () => void;
+  getLayout: () => TuiLayout;
+  getContentWidth: () => number;
+  handleResize: () => void;
 }
 
 export function createThinkingStatus(output: NodeJS.WritableStream, lang: Language) {
@@ -83,8 +101,8 @@ export function clearInteractiveViewport(output: NodeJS.WritableStream) {
     return;
   }
 
-  output.write("\x1B[r");
-  output.write("\x1B[2J\x1B[H");
+  output.write(ANSI.clearScrollRegion);
+  output.write(ANSI.clearScreen);
 }
 
 export function renderStatusPanel(options: {
@@ -109,15 +127,30 @@ export function renderStatusPanel(options: {
     `${t("repl.status.hint", options.lang)}: ${options.hint}`
   ];
 
-  return renderPanelText(t("repl.status.title", options.lang), lines);
+  return lines.join("\n");
+}
+
+export function renderTuiStatusBox(
+  title: string,
+  contentLines: string[],
+  width: number
+): string {
+  let result = renderBoxTop(title, width);
+
+  for (const line of contentLines) {
+    result += renderBoxLine(line, width);
+  }
+
+  result += renderBoxBottom(width);
+  return result;
 }
 
 export function renderPanelHeader(title: string): string {
-  return `+-- ${title} ${"-".repeat(Math.max(1, 58 - title.length))}+\n`;
+  return `┌─ ${title} ${"─".repeat(Math.max(1, 55 - title.length))}┐\n`;
 }
 
 export function renderPanelText(title: string, lines: string[]): string {
-  return `${renderPanelHeader(title)}${lines.join("\n")}\n`;
+  return `${renderPanelHeader(title)}${lines.map((line) => `│ ${line}`).join("\n")}\n└${"─".repeat(58)}┘\n`;
 }
 
 export function renderPanelMessage(title: string, message: string): string {
@@ -129,102 +162,207 @@ export function createPersistentStatusArea(
   renderers: {
     renderStatusPanel: () => string;
     renderWelcomeBanner: () => string;
-  }
+    renderInputPanel?: (contentWidth: number) => string;
+  },
+  lang: Language = "en"
 ): PersistentStatusArea | null {
-  const interactiveOutput = output as NodeJS.WritableStream & { isTTY?: boolean; rows?: number };
+  const interactiveOutput = output as NodeJS.WritableStream & { isTTY?: boolean; rows?: number; columns?: number };
 
   if (interactiveOutput.isTTY !== true) {
     return null;
   }
 
   let active = false;
-  let lastStatusHeight = 0;
+  let layout: TuiLayout | null = null;
+  let chatBuffer = renderers.renderWelcomeBanner();
 
-  const getTerminalRows = () => Math.max(interactiveOutput.rows ?? 24, 8);
-  const getScrollTopRow = () => Math.min(lastStatusHeight + 1, getTerminalRows());
+  const getTermRows = () => Math.max(interactiveOutput.rows ?? 24, 12);
+  const getTermCols = () => Math.max(interactiveOutput.columns ?? 80, 40);
 
-  const renderStatusLines = () => {
-    const lines = splitRenderableLines(renderers.renderStatusPanel());
-    const clearRows = Math.max(lastStatusHeight, lines.length);
-
-    for (let index = 0; index < clearRows; index += 1) {
-      output.write(`\x1B[${index + 1};1H\x1B[2K`);
-
-      if (index < lines.length) {
-        output.write(lines[index]);
-      }
-    }
-
-    lastStatusHeight = lines.length;
+  const getStatusContentLines = (): string[] => {
+    const raw = renderers.renderStatusPanel();
+    return splitRenderableLines(raw);
   };
 
-  const applyScrollRegion = () => {
-    output.write(`\x1B[${getScrollTopRow()};${getTerminalRows()}r`);
+  const computeCurrentLayout = (): TuiLayout => {
+    const statusLines = getStatusContentLines();
+    return computeLayout(getTermRows(), getTermCols(), statusLines.length);
   };
 
-  const moveCursorToBody = (clearToEnd = false) => {
-    output.write(`\x1B[${getScrollTopRow()};1H`);
+  const renderStatusBoxContent = (currentLayout: TuiLayout) => {
+    const statusLines = getStatusContentLines();
+    const title = t("repl.status.title", lang);
+    const boxStr = renderTuiStatusBox(title, statusLines, currentLayout.contentWidth + 4);
+    const lines = splitRenderableLines(boxStr);
 
-    if (clearToEnd) {
-      output.write("\x1B[J");
+    for (let i = 0; i < lines.length; i++) {
+      output.write(ANSI.cursorTo(i + 1, 1));
+      output.write(ANSI.clearLine);
+      output.write(lines[i]!);
     }
+  };
+
+  const renderChatBoxBorders = (currentLayout: TuiLayout) => {
+    const chatTitle = t("tui.chat.title", lang);
+    const width = currentLayout.contentWidth + 4;
+
+    output.write(ANSI.cursorTo(currentLayout.chatBox.topBorderRow, 1));
+    output.write(ANSI.clearLine);
+    output.write(renderBoxTop(chatTitle, width).trimEnd());
+
+    output.write(ANSI.cursorTo(currentLayout.chatBox.bottomBorderRow, 1));
+    output.write(ANSI.clearLine);
+    output.write(renderBoxBottom(width).trimEnd());
+  };
+
+  const renderInputBoxContent = (currentLayout: TuiLayout) => {
+    const inputTitle = t("tui.input.title", lang);
+    const width = currentLayout.contentWidth + 4;
+    const promptText = renderers.renderInputPanel
+      ? renderers.renderInputPanel(currentLayout.contentWidth)
+      : "";
+
+    output.write(ANSI.cursorTo(currentLayout.inputBox.topBorderRow, 1));
+    output.write(ANSI.clearLine);
+    output.write(renderBoxTop(inputTitle, width).trimEnd());
+
+    output.write(ANSI.cursorTo(currentLayout.inputBox.contentStartRow, 1));
+    output.write(ANSI.clearLine);
+    output.write(renderBoxLine(promptText, width).trimEnd());
+
+    output.write(ANSI.cursorTo(currentLayout.inputBox.bottomBorderRow, 1));
+    output.write(ANSI.clearLine);
+    output.write(renderBoxBottom(width).trimEnd());
+  };
+
+  const applyScrollRegion = (currentLayout: TuiLayout) => {
+    output.write(ANSI.scrollRegion(currentLayout.chatScrollTop, currentLayout.chatScrollBottom));
+  };
+
+  const moveCursorToChatBottom = (currentLayout: TuiLayout) => {
+    output.write(ANSI.cursorTo(currentLayout.chatScrollBottom, 1));
+  };
+
+  const replayChatBuffer = () => {
+    if (chatBuffer.length === 0) {
+      return;
+    }
+
+    output.write(chatBuffer);
+  };
+
+  const renderAll = () => {
+    layout = computeCurrentLayout();
+    output.write(ANSI.clearScreen);
+    renderStatusBoxContent(layout);
+    renderChatBoxBorders(layout);
+    renderInputBoxContent(layout);
+    applyScrollRegion(layout);
+    moveCursorToChatBottom(layout);
+    replayChatBuffer();
   };
 
   return {
     initialize() {
       active = true;
-      output.write("\x1B[2J\x1B[H");
-      renderStatusLines();
-      applyScrollRegion();
-      moveCursorToBody(true);
-      output.write(renderers.renderWelcomeBanner());
+      renderAll();
     },
     refresh() {
-      if (!active) {
+      if (!active || !layout) {
         return;
       }
 
-      output.write("\x1B7");
-      renderStatusLines();
-      applyScrollRegion();
-      output.write("\x1B8");
+      output.write(ANSI.saveCursor);
+      renderStatusBoxContent(layout);
+      renderInputBoxContent(layout);
+      applyScrollRegion(layout);
+      output.write(ANSI.restoreCursor);
     },
     clearBody() {
-      if (!active) {
+      if (!active || !layout) {
         return;
       }
 
-      output.write("\x1B[2J\x1B[H");
-      renderStatusLines();
-      applyScrollRegion();
-      moveCursorToBody(true);
+      chatBuffer = "";
+
+      output.write(ANSI.saveCursor);
+      renderStatusBoxContent(layout);
+      renderChatBoxBorders(layout);
+
+      for (let row = layout.chatBox.contentStartRow; row <= layout.chatBox.contentEndRow; row++) {
+        output.write(ANSI.cursorTo(row, 1));
+        output.write(ANSI.clearLine);
+      }
+
+      renderInputBoxContent(layout);
+      applyScrollRegion(layout);
+      moveCursorToChatBottom(layout);
+      output.write(ANSI.restoreCursor);
     },
     suspend() {
       if (!active) {
         return;
       }
 
-      output.write("\x1B[r");
+      output.write(ANSI.clearScrollRegion);
     },
     resume() {
+      if (!active || !layout) {
+        return;
+      }
+
+      output.write(ANSI.saveCursor);
+      renderAll();
+      output.write(ANSI.restoreCursor);
+    },
+    writeChatLine(text: string) {
+      if (!layout) {
+        output.write(text + "\n");
+        return;
+      }
+
+      const wrapped = wrapLine(text, layout.contentWidth);
+
+      for (const line of wrapped) {
+        output.write(line + "\n");
+      }
+    },
+    writeChatRaw(text: string) {
+      chatBuffer += text;
+      output.write(text);
+    },
+    redrawInputPanel() {
+      if (!active || !layout) {
+        return;
+      }
+
+      output.write(ANSI.saveCursor);
+      renderInputBoxContent(layout);
+      applyScrollRegion(layout);
+      output.write(ANSI.restoreCursor);
+    },
+    getLayout() {
+      return layout ?? computeCurrentLayout();
+    },
+    getContentWidth() {
+      return layout?.contentWidth ?? computeCurrentLayout().contentWidth;
+    },
+    handleResize() {
       if (!active) {
         return;
       }
 
-      output.write("\x1B7");
-      renderStatusLines();
-      applyScrollRegion();
-      output.write("\x1B8");
+      renderAll();
     },
     dispose(options?: { clearViewport?: boolean }) {
       if (!active) {
         return;
       }
 
-      output.write("\x1B[r");
+      output.write(ANSI.clearScrollRegion);
 
       if (options?.clearViewport) {
-        output.write("\x1B[2J\x1B[H");
+        output.write(ANSI.clearScreen);
       }
 
       active = false;
@@ -240,22 +378,40 @@ export function formatPluginDiscoveryStatus(info: { enabledCount: number; errorC
   return `${info.enabledCount} enabled`;
 }
 
-export function renderWelcomeBanner(lang: Language): string {
+const ASCII_BANNER_ART = [
+  "  _________________________________________________ ",
+  " /                                                 \\",
+  "|                   DeepVibe                        |",
+  "|               CLI coding workflow                 |",
+  " \\_________________________________________________/"
+];
+
+const UNICODE_BANNER_ART = [
+  "      ⢀⣀⣀⢀⣀⣠⣤⡀  ⢠⣄",
+  "  ⢀⣠⣶⣿⣿⣿⣿⣿⣿⣿⣯⡀  ⣿⣿⣷⣄⣀⣤⣤⣾⠆",
+  " ⢠⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣀⠘⣿⣿⣿⣿⣿⣿⡟",
+  " ⣿⣿⠿⠿⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⣬⣿⣿⡟⠛⠉",
+  " ⣿⣿    ⠉⠻⣿⣿⣿⣿⣿⡏⢻⣿⣿⣿⣿⡇",
+  " ⣿⣿⣆     ⠈⠻⣿⣿⣿⣷⣶⣿⣿⣿⡟",
+  " ⠸⣿⣿⣦⡀  ⣀⣀ ⠙⢿⣿⣿⣿⣿⣿⡟",
+  "  ⠘⢿⣿⣿⣦⣄⣹⣿⣿⣦⣈⠻⣿⣿⣿⣿⣤⡀",
+  "    ⠉⠻⢿⣿⣿⣿⣿⣿⣿⡿⠟⠛⠛⠛⠛⠁"
+];
+
+let cachedWindowsUtf8CodePage: boolean | null = null;
+
+export function resetWelcomeBannerEncodingCacheForTest(): void {
+  cachedWindowsUtf8CodePage = null;
+}
+
+export function renderWelcomeBanner(
+  lang: Language,
+  output: NodeJS.WritableStream = process.stdout
+): string {
   const title = t("repl.ready", lang);
   const blue = "\x1B[34m";
   const reset = "\x1B[0m";
-
-  const art = [
-    "      猗€猓€猓€猗€猓€猓犫￥狻€  猗犫",
-    "  猗€猓犫６猓库？猓库？猓库？猓库／狻€  猓库？猓封猓€猓も￥猓锯爢",
-    " 猗犫？猓库？猓库？猓库？猓库？猓库？猓库＆猓€鉅樷？猓库？猓库？猓库",
-    " 猓库？鉅库牽鉅库？猓库？猓库？猓库？猓库？猓库＇猓？猓库鉅涒爥",
-    " 猓库？    鉅夆牷猓库？猓库？猓库猗烩？猓库？猓库",
-    " 猓库？猓?    鉅堚牷猓库？猓库７猓垛？猓库？狻?",
-    " 鉅糕？猓库＆狻€  猓€猓€ 鉅欌⒖猓库？猓库？猓库",
-    "  鉅樷⒖猓库？猓︹猓光？猓库＆猓堚牷猓库？猓库？猓も",
-    "    鉅夆牷猗库？猓库？猓库？猓库】鉅熲牄鉅涒牄鉅涒爜"
-  ];
+  const art = shouldUseUnicodeBanner(output) ? UNICODE_BANNER_ART : ASCII_BANNER_ART;
 
   const lines = art.map((line) => `  ${blue}${line}${reset}`);
 
@@ -265,6 +421,56 @@ export function renderWelcomeBanner(lang: Language): string {
     `  ${title}`,
     ""
   ].join("\n");
+}
+
+function shouldUseUnicodeBanner(output: NodeJS.WritableStream): boolean {
+  const mode = (process.env.DEEPVIBE_BANNER ?? "").trim().toLowerCase();
+
+  if (mode === "ascii") {
+    return false;
+  }
+
+  if (mode === "unicode" || mode === "utf8") {
+    return true;
+  }
+
+  const ttyOutput = output as NodeJS.WritableStream & { isTTY?: boolean };
+
+  if (ttyOutput.isTTY !== true) {
+    return false;
+  }
+
+  const locale = [
+    process.env.LANG ?? "",
+    process.env.LC_ALL ?? "",
+    process.env.LC_CTYPE ?? "",
+    process.env.LC_MESSAGES ?? ""
+  ].join(" ");
+
+  if (/utf-?8/i.test(locale)) {
+    return true;
+  }
+
+  return true;
+}
+
+function isWindowsUtf8CodePage(): boolean {
+  if (cachedWindowsUtf8CodePage !== null) {
+    return cachedWindowsUtf8CodePage;
+  }
+
+  try {
+    const output = execFileSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "chcp"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true
+    });
+    cachedWindowsUtf8CodePage = /\b65001\b/.test(output);
+  } catch {
+    cachedWindowsUtf8CodePage = false;
+  }
+
+  return cachedWindowsUtf8CodePage;
 }
 
 function splitRenderableLines(value: string): string[] {

@@ -1,6 +1,7 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 
 import { runEngine, type RunEngineDependencies, type RunEngineOptions } from "./engine.js";
+import { createFimCompletion } from "./fim.js";
 import { undoLastAiChange } from "./project/git-manager.js";
 import { TaskManager, type ServiceTaskEvent, type ServiceTaskSnapshot } from "./task-manager.js";
 import {
@@ -14,6 +15,7 @@ import {
 import type { ChatMessage } from "./llm/deepseek-client.js";
 
 export interface ServiceDependencies extends RunEngineDependencies {
+  createFimCompletion?: typeof createFimCompletion;
   runEngine?: typeof runEngine;
   taskManager?: TaskManager;
   undoLastAiChange?: typeof undoLastAiChange;
@@ -69,6 +71,7 @@ export function createServiceServer(options: StartServiceOptions = {}): http.Ser
   const host = options.host ?? DEFAULT_HOST;
   const port = options.port ?? DEFAULT_PORT;
   const cwd = options.cwd ?? process.cwd();
+  const executeFimCompletion = options.dependencies?.createFimCompletion ?? createFimCompletion;
   const executeRunEngine = options.dependencies?.runEngine ?? runEngine;
   const executeUndo = options.dependencies?.undoLastAiChange ?? undoLastAiChange;
   const taskManager = options.dependencies?.taskManager ?? new TaskManager();
@@ -97,6 +100,15 @@ export function createServiceServer(options: StartServiceOptions = {}): http.Ser
           normalizeRunOptions(body, cwd),
           withServiceDependencies(options.dependencies)
         );
+        sendJson(response, 200, { ok: true, result });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/completions/fim") {
+        const body = await readJsonBody(request);
+        const result = await executeFimCompletion(normalizeFimOptions(body, cwd), {
+          createClient: options.dependencies?.createClient
+        });
         sendJson(response, 200, { ok: true, result });
         return;
       }
@@ -227,6 +239,7 @@ export function createServiceServer(options: StartServiceOptions = {}): http.Ser
         const rpcRequest = (await readJsonBody(request)) as JsonRpcRequest;
         const rpcResponse = await handleJsonRpcRequest(rpcRequest, {
           cwd,
+          executeFimCompletion,
           dependencies: options.dependencies,
           executeRunEngine,
           executeUndo,
@@ -289,6 +302,7 @@ async function handleJsonRpcRequest(
   request: JsonRpcRequest,
   options: {
     cwd: string;
+    executeFimCompletion: typeof createFimCompletion;
     dependencies?: ServiceDependencies;
     executeRunEngine: typeof runEngine;
     executeUndo: typeof undoLastAiChange;
@@ -308,6 +322,13 @@ async function handleJsonRpcRequest(
         withServiceDependencies(options.dependencies)
       );
 
+      return rpcResult(id, result);
+    }
+
+    if (request.method === "deepvibe.completion.fim") {
+      const result = await options.executeFimCompletion(normalizeFimOptions(request.params, options.cwd), {
+        createClient: options.dependencies?.createClient
+      });
       return rpcResult(id, result);
     }
 
@@ -453,6 +474,33 @@ function normalizeRunOptions(input: unknown, cwd: string): RunEngineOptions {
     instruction: input.instruction,
     dryRun: Boolean(input.dryRun),
     profile: profile ?? "default"
+  };
+}
+
+function normalizeFimOptions(input: unknown, cwd: string): Parameters<typeof createFimCompletion>[0] {
+  const params = isRecord(input) ? input : {};
+
+  if (typeof params.prompt !== "string" || params.prompt.trim().length === 0) {
+    throw new Error("Missing prompt for FIM completion.");
+  }
+
+  return {
+    cwd: typeof params.cwd === "string" && params.cwd.trim().length > 0 ? params.cwd : cwd,
+    echo: typeof params.echo === "boolean" ? params.echo : undefined,
+    logprobs: typeof params.logprobs === "number" ? params.logprobs : undefined,
+    maxTokens: typeof params.maxTokens === "number" ? params.maxTokens : undefined,
+    model: params.model === "deepseek-v4-pro" ? params.model : undefined,
+    prompt: params.prompt,
+    stop:
+      typeof params.stop === "string"
+        ? params.stop
+        : Array.isArray(params.stop) && params.stop.every((value) => typeof value === "string")
+          ? params.stop
+          : undefined,
+    stream: typeof params.stream === "boolean" ? params.stream : undefined,
+    suffix: typeof params.suffix === "string" ? params.suffix : undefined,
+    temperature: typeof params.temperature === "number" ? params.temperature : undefined,
+    topP: typeof params.topP === "number" ? params.topP : undefined
   };
 }
 

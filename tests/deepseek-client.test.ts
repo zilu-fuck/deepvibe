@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ContextMessage } from "../src/context/token-counter.js";
 import {
   buildChatCompletionBody,
+  buildFimCompletionBody,
   DeepSeekClient,
   DeepSeekClientError,
   type ChatCompletionTool
@@ -62,6 +63,27 @@ describe("buildChatCompletionBody", () => {
     expect(body).toMatchObject({
       tools,
       tool_choice: "auto"
+    });
+  });
+});
+
+describe("buildFimCompletionBody", () => {
+  it("builds a beta completion payload with suffix support", () => {
+    const body = buildFimCompletionBody({
+      model: "deepseek-v4-pro",
+      prompt: "function test() {",
+      suffix: "}",
+      maxTokens: 64,
+      stream: true
+    });
+
+    expect(body).toMatchObject({
+      model: "deepseek-v4-pro",
+      prompt: "function test() {",
+      suffix: "}",
+      max_tokens: 64,
+      stream: true,
+      stream_options: { include_usage: true }
     });
   });
 });
@@ -221,6 +243,87 @@ describe("DeepSeekClient", () => {
       })
     ).rejects.toThrowError(DeepSeekClientError);
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the beta completions endpoint for FIM requests", async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "fim_1",
+          choices: [
+            {
+              text: "return value;",
+              finish_reason: "stop",
+              logprobs: null
+            }
+          ],
+          usage: {
+            total_tokens: 9
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+    const client = new DeepSeekClient({
+      apiKey: "test-key",
+      fetchFn
+    });
+
+    const result = await client.createFimCompletion({
+      model: "deepseek-v4-pro",
+      prompt: "if (value) {",
+      suffix: "}"
+    });
+
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("https://api.deepseek.com/beta/completions");
+    expect(result).toMatchObject({
+      id: "fim_1",
+      content: "return value;",
+      finishReason: "stop",
+      usage: { total_tokens: 9 }
+    });
+  });
+
+  it("parses streaming FIM completion chunks", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            [
+              "data: {\"id\":\"fim_stream\",\"choices\":[{\"text\":\"return \",\"finish_reason\":null}],\"usage\":null}\n\n",
+              "data: {\"id\":\"fim_stream\",\"choices\":[{\"text\":\"value;\",\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+              "data: {\"id\":\"fim_stream\",\"choices\":[],\"usage\":{\"total_tokens\":11}}\n\n",
+              "data: [DONE]\n\n"
+            ].join("")
+          )
+        );
+        controller.close();
+      }
+    });
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    const client = new DeepSeekClient({
+      apiKey: "test-key",
+      fetchFn
+    });
+
+    const result = await client.createFimCompletion({
+      model: "deepseek-v4-pro",
+      prompt: "if (value) {",
+      suffix: "}",
+      stream: true
+    });
+
+    expect(result).toMatchObject({
+      id: "fim_stream",
+      content: "return value;",
+      finishReason: "stop",
+      usage: { total_tokens: 11 }
+    });
   });
 
   it("retries network errors before succeeding", async () => {

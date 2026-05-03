@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+
 export type Language = "en" | "zh";
 
 export interface TranslationDictionary {
@@ -12,6 +14,7 @@ const translations: Record<Language, TranslationDictionary> = {
     "repl.mode.project": "Project mode: Git repository detected. File edits and agent actions are available.",
     "repl.mode.chat_only": "Chat-only mode: no Git repository detected. Normal conversation is available, but file edits are disabled until you enter a repository.",
     "repl.repo_init.prompt": "This directory is not a Git repository. Initialize one now so I can create and edit project files? [Y]es [N]o: ",
+    "repl.repo_init.startup_prompt": "This directory is not a Git repository. Initialize one now so I can create and edit project files? [Y]es [N]o: ",
     "repl.repo_init.done": "Git repository initialized. Switched to project mode.",
     "repl.repo_init.declined": "Continuing in chat-only mode.",
     "repl.repo_init.failed": "Failed to initialize Git repository: {message}",
@@ -24,12 +27,16 @@ const translations: Record<Language, TranslationDictionary> = {
     "repl.status.workspace_path": "Workspace Path",
     "repl.status.ready": "Ready",
     "repl.status.hint": "Hint",
+    "tui.chat.title": "Chat",
+    "tui.input.title": "Input",
     "repl.thinking": "[Thinking...]",
     "repl.assistant": "Assistant:",
     "repl.thoughts.hidden": "[Thought process hidden. Type /thoughts to view the full trace.]",
     "repl.thoughts.empty": "No thought trace is available for the latest response.",
     "repl.thoughts.title": "Thought Trace",
     "repl.thoughts.return": "Press Enter, q, or Esc to return.",
+    "repl.history.title": "Conversation History",
+    "repl.viewer.controls": "Up/Down, j/k, PgUp/PgDn, Home/End, or mouse wheel scroll. Enter, q, or Esc closes.",
     "repl.interrupted": "\nSession interrupted. Type /quit to exit.",
     "repl.goodbye": "Goodbye!",
     "repl.preflight": "Analyzing project...",
@@ -112,6 +119,7 @@ const translations: Record<Language, TranslationDictionary> = {
     "repl.mode.project": "项目模式：已检测到 Git 仓库，可使用文件编辑和 agent 能力。",
     "repl.mode.chat_only": "纯聊天模式：当前目录不是 Git 仓库，可以正常聊天，但文件修改功能会在进入仓库后才启用。",
     "repl.repo_init.prompt": "当前目录不是 Git 仓库。是否现在初始化仓库，以便我创建和修改项目文件？[Y] 是 [N] 否：",
+    "repl.repo_init.startup_prompt": "当前目录不是 Git 仓库。是否现在初始化仓库，以便我创建和修改项目文件？[Y] 是 [N] 否：",
     "repl.repo_init.done": "Git 仓库已初始化，现已切换到项目模式。",
     "repl.repo_init.declined": "继续保持纯聊天模式。",
     "repl.repo_init.failed": "初始化 Git 仓库失败：{message}",
@@ -123,11 +131,15 @@ const translations: Record<Language, TranslationDictionary> = {
     "repl.thoughts.empty": "最近一条回复没有可查看的思考过程。",
     "repl.thoughts.title": "思考过程",
     "repl.thoughts.return": "按回车、q 或 Esc 返回。",
+    "repl.history.title": "对话历史",
+    "repl.viewer.controls": "方向键、j/k、PgUp/PgDn、Home/End 或鼠标滚轮可滚动。回车、q 或 Esc 关闭。",
     "repl.interrupted": "\n会话已中断。输入 /quit 退出。",
     "repl.goodbye": "再见！",
     "repl.preflight": "正在分析项目...",
     "repl.tool.running": "  运行 {tool}...",
     "repl.prompt": "deepvibe> ",
+    "tui.chat.title": "对话",
+    "tui.input.title": "输入",
 
     "cmd.help.title": "命令：",
     "cmd.help.new": "  /new          开始新会话",
@@ -207,6 +219,24 @@ export function detectLanguage(): Language {
 
   if (lang.startsWith("zh")) {
     return "zh";
+  }
+
+  if (process.env.NODE_ENV === "test" || process.env.VITEST) {
+    return "en";
+  }
+
+  try {
+    const output = execFileSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "chcp"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+      timeout: 2000
+    });
+    if (/\b(936|54936|950|20936|10008)\b/.test(output)) {
+      return "zh";
+    }
+  } catch {
+    // shell detection failed
   }
 
   return "en";

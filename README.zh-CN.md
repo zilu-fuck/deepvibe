@@ -22,14 +22,20 @@
 - 内置 HTTP + JSON-RPC 服务模式
 - 基于任务的 SSE 事件流、取消和服务端并发隔离
 - 首版本地插件系统，可扩展工具能力
+- 插件生命周期 hooks，以及隔离的 initialize/execute/dispose 处理
 - 通过 `.deepvibe/prompt.md` 注入项目级自定义系统提示词
-- 带流式输出和逐轮确认的交互式 REPL
+- 带 chat-only/project mode 切换、流式输出和逐轮确认的交互式 REPL
+- 在非仓库目录下，为 REPL 和单次写请求提供自动 `git init` 引导
+- 面向空仓库的最小项目脚手架引导
 - 带持久化、切换和历史的会话管理
 - 多步骤计划模式，支持逐步执行
+- 默认写请求会走 `plan -> confirm -> execute -> verify`
+- 通过 DeepSeek beta completions API 与服务端点提供 FIM completion 支持
 
 当前缺口：
 
-- 插件生命周期管理与资源治理目前仍停留在首版超时/内存上限级别
+- REPL 目前仍是持续演进中的面板式 TUI，而不是完全固定分区的终态布局
+- FIM 已接入客户端/服务层，但面向编辑器的内联补全交互还未完成
 
 ## 环境要求
 
@@ -294,13 +300,15 @@ pnpm cli "update API timeout handling"
 
 CLI 会：
 
-1. 扫描项目
-2. 构建上下文
-3. 调用模型
-4. 展示变更摘要
-5. 询问你选择 `[A]ccept / [R]eview / [N]o`
+1. 如果当前目录不是 Git 仓库且请求需要写入，会先提示是否初始化 `git`
+2. 对写请求自动切换到 plan mode，除非你显式使用 `--force`
+3. 在执行前先展示计划给你确认
+4. 逐步执行，并支持按文件 review 后再应用
+5. 变更落盘后，如果工作区存在允许的测试/构建命令，会自动执行最佳努力验证
 
 在 review 模式下，CLI 会逐个文件展示 diff，你可以在真正写入之前按文件决定应用或跳过。
+
+如果仓库是刚初始化的空目录，且你的请求是“开始一个项目”，DeepVibe 会先尽量生成最小可行脚手架，而不是直接铺开可选基础设施。
 
 跳过确认：
 
@@ -336,6 +344,7 @@ pnpm cli serve --host 127.0.0.1 --port 4242
 
 - `GET /health`
 - `POST /run`
+- `POST /completions/fim`
 - `POST /undo`
 - `POST /rpc`，用于 JSON-RPC 2.0
 - `POST /tasks/run`
@@ -423,7 +432,17 @@ chat-only mode 说明：
 - 即使不在 Git 仓库里，普通聊天也能正常工作
 - 在进入 Git 仓库之前，文件编辑、补丁应用和仓库操作都会保持禁用
 - 如果你在 chat-only mode 下提出明确的建项目/建文件类需求，DeepVibe 可以提示是否执行 `git init` 并切换到 project mode
+- 如果具备模型能力，DeepVibe 会优先使用对话式工程意图分类；否则回退到启发式判断
 - 当你在 Git 仓库里打开 REPL 后，DeepVibe 会恢复完整项目模式
+
+## FIM Completion
+
+DeepVibe 现在通过以下接口暴露 Fill-in-the-Middle completion：
+
+- HTTP：`POST /completions/fim`
+- JSON-RPC：`deepvibe.completion.fim`
+
+这条链路使用 DeepSeek 的 beta completions 端点，面向未来编辑器或 IDE 的 prompt/suffix 式补全接入。
 
 ## 多步骤计划模式
 
@@ -480,9 +499,21 @@ pnpm release:smoke
 - [src/engine.ts](./src/engine.ts)
 - [src/cli.ts](./src/cli.ts)
 - [src/repl.ts](./src/repl.ts)
+- [src/status.ts](./src/status.ts)
+- [src/intent.ts](./src/intent.ts)
+- [src/project-bootstrap.ts](./src/project-bootstrap.ts)
+- [src/verification.ts](./src/verification.ts)
 - [src/context-store.ts](./src/context-store.ts)
+- [src/cli-confirmation.ts](./src/cli-confirmation.ts)
+- [src/command-approval-store.ts](./src/command-approval-store.ts)
+- [src/workspace-access.ts](./src/workspace-access.ts)
+- [src/workspace-landing.ts](./src/workspace-landing.ts)
 - [src/search.ts](./src/search.ts)
 - [src/tools.ts](./src/tools.ts)
+- [src/plugins.ts](./src/plugins.ts)
+- [src/server.ts](./src/server.ts)
+- [src/task-manager.ts](./src/task-manager.ts)
+- [src/fim.ts](./src/fim.ts)
 - [src/project/scanner.ts](./src/project/scanner.ts)
 - [src/context/builder.ts](./src/context/builder.ts)
 - [src/llm/deepseek-client.ts](./src/llm/deepseek-client.ts)

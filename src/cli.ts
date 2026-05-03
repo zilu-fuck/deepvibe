@@ -25,6 +25,7 @@ import {
 import { loadConfig, setConfigValue } from "./config.js";
 import { applyPreparedExecution, executePlanSteps, generatePlan, prepareExecution, runEngine, type ExecutionProfile, type PreparedExecution, type RunEngineDependencies, type PlanStepResult } from "./engine.js";
 import type { Language } from "./i18n.js";
+import { detectEngineeringIntent } from "./intent.js";
 import {
   createAiCommit,
   initializeRepository,
@@ -39,9 +40,11 @@ import {
   type ReplProfileSelection,
   type ReplReasoningEffect
 } from "./model-profile.js";
+import { applyBootstrapGuidance } from "./project-bootstrap.js";
 import { startRepl } from "./repl.js";
 import { startService } from "./server.js";
-import { createDockerSandboxCommandRunner, type CommandApprovalRequest } from "./tools.js";
+import { createDockerSandboxCommandRunner, resolveCommandPermissions, type CommandApprovalRequest } from "./tools.js";
+import { formatVerificationSummary, verifyWrittenChanges } from "./verification.js";
 import {
   clearWorkspaceTrust,
   getDefaultWorkspaceSandboxConfig,
@@ -63,6 +66,7 @@ export interface CliDependencies extends RunEngineDependencies {
   confirmPlanStep?: typeof confirmPlanStep;
   confirmPreparedExecution?: typeof confirmPreparedExecution;
   cwd?: () => string;
+  detectEngineeringIntent?: typeof detectEngineeringIntent;
   emitStepEvent?: (event: { type: string; stepIndex: number; totalSteps: number; payload?: Record<string, unknown> }) => void;
   generatePlan?: typeof generatePlan;
   homeDir?: string;
@@ -77,6 +81,7 @@ export interface CliDependencies extends RunEngineDependencies {
   stdin?: NodeJS.ReadableStream;
   stdout?: NodeJS.WritableStream;
   undoLastAiChange?: typeof undoLastAiChange;
+  verifyWrittenChanges?: typeof verifyWrittenChanges;
 }
 
 export {
@@ -108,6 +113,8 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   const executeSetConfigValue = dependencies.setConfigValue ?? setConfigValue;
   const executeStartRepl = dependencies.startRepl ?? startRepl;
   const executeStartService = dependencies.startService ?? startService;
+  const executeDetectEngineeringIntent = dependencies.detectEngineeringIntent ?? detectEngineeringIntent;
+  const executeVerifyWrittenChanges = dependencies.verifyWrittenChanges ?? verifyWrittenChanges;
   let approvalStore = loadCommandApprovalStore(cwd());
   const program = new Command();
   program.enablePositionalOptions();
@@ -192,6 +199,53 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       stdout.write(`DeepVibe service listening on http://${service.host}:${service.port}\n`);
     });
 
+  const runChatRepl = async (cliOptions: CliProfileOptions & { lang?: string; session?: string }, command: Command) => {
+    const access = await prepareWorkspace({
+      cwd: cwd(),
+      homeDir: dependencies.homeDir,
+      input: stdin,
+      output: stdout
+    });
+    config = await ensureApiKeyConfigured({
+      config: loadConfig({ cwd: access.effectiveCwd, homeDir: dependencies.homeDir }),
+      cwd: access.effectiveCwd,
+      homeDir: dependencies.homeDir,
+      input: stdin,
+      output: stdout,
+      setConfigValue: executeSetConfigValue
+    });
+    const accessDependencies = withWorkspaceAccessDependencies(access, config, dependencies);
+
+    const chatOptions = mergeCommandOptions(cliOptions, command);
+    const profile = resolveCliProfile(chatOptions);
+    const lang = chatOptions.lang === "zh" ? "zh" : chatOptions.lang === "en" ? "en" : undefined;
+    await executeStartRepl({
+      cwd: access.effectiveCwd,
+      profile: profile.legacyProfile,
+      profileSelection: profile.selection,
+      sessionId: chatOptions.session,
+      lang,
+      workspaceMode: access.mode,
+      requestedCwd: access.requestedCwd
+    }, {
+      ...accessDependencies,
+      applyPreparedExecution: createWorkspaceAwareApplyFunction({
+        access,
+        applyPreparedExecutionImpl: executeApply,
+        confirmPreparedExecutionImpl: dependencies.confirmPreparedExecution ?? confirmPreparedExecution,
+        force: false,
+        inspectRepositoryImpl: dependencies.inspectRepository,
+        createAiCommitImpl: dependencies.createAiCommit,
+        recordOperationImpl: dependencies.recordOperation,
+        stdin,
+        stdout
+      }),
+      stdin,
+      stdout,
+      stderr
+    });
+  };
+
   program
     .command("chat")
     .description("start an interactive REPL session")
@@ -202,50 +256,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     .option("--session <id>", "resume a specific session by id")
     .option("--lang <language>", "interface language (en or zh)", "auto")
     .action(async (options: CliProfileOptions & { lang?: string; session?: string }, command: Command) => {
-      const access = await prepareWorkspace({
-        cwd: cwd(),
-        homeDir: dependencies.homeDir,
-        input: stdin,
-        output: stdout
-      });
-      config = await ensureApiKeyConfigured({
-        config: loadConfig({ cwd: access.effectiveCwd, homeDir: dependencies.homeDir }),
-        cwd: access.effectiveCwd,
-        homeDir: dependencies.homeDir,
-        input: stdin,
-        output: stdout,
-        setConfigValue: executeSetConfigValue
-      });
-      const accessDependencies = withWorkspaceAccessDependencies(access, config, dependencies);
-
-      const chatOptions = mergeCommandOptions(options, command);
-      const profile = resolveCliProfile(chatOptions);
-      const lang = chatOptions.lang === "zh" ? "zh" : chatOptions.lang === "en" ? "en" : undefined;
-      await executeStartRepl({
-        cwd: access.effectiveCwd,
-        profile: profile.legacyProfile,
-        profileSelection: profile.selection,
-        sessionId: chatOptions.session,
-        lang,
-        workspaceMode: access.mode,
-        requestedCwd: access.requestedCwd
-      }, {
-        ...accessDependencies,
-        applyPreparedExecution: createWorkspaceAwareApplyFunction({
-          access,
-          applyPreparedExecutionImpl: executeApply,
-          confirmPreparedExecutionImpl: dependencies.confirmPreparedExecution ?? confirmPreparedExecution,
-          force: false,
-          inspectRepositoryImpl: dependencies.inspectRepository,
-          createAiCommitImpl: dependencies.createAiCommit,
-          recordOperationImpl: dependencies.recordOperation,
-          stdin,
-          stdout
-        }),
-        stdin,
-        stdout,
-        stderr
-      });
+      await runChatRepl(options, command);
     });
 
   program
@@ -257,32 +268,77 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     .option("--effect <level>", "reasoning strength (low, medium, high, xhigh)")
     .option("--flash", "legacy alias for --model flash --effect high")
     .option("--deep", "legacy alias for --model pro --effect xhigh")
+    .option("--lang <language>", "interface language (en or zh)", "auto")
+    .option("--session <id>", "resume a specific session by id")
     .option("--plan", "generate a multi-step plan first, then confirm and execute step by step")
-    .action(async (instruction: string | undefined, options: CliProfileOptions & { dryRun?: boolean; force?: boolean; init?: boolean; plan?: boolean }) => {
+    .action(async (instruction: string | undefined, options: CliProfileOptions & { dryRun?: boolean; force?: boolean; init?: boolean; plan?: boolean; lang?: string; session?: string }) => {
       if (!instruction) {
-        program.outputHelp();
+        await runChatRepl(options, new Command());
         return;
       }
 
       const profile = resolveCliProfile(options);
       const requestedCwd = cwd();
-      const executionOptions = {
+      const intentDecision =
+        options.dryRun
+          ? undefined
+          : await executeDetectEngineeringIntent(
+              {
+                cwd: requestedCwd,
+                instruction,
+                profileSettings: profile.profileSettings
+              },
+              {
+                createClient: dependencies.createClient
+              }
+            );
+      const initialization = options.dryRun
+        ? { declined: false, initialized: false }
+        : await maybeInitializeRepositoryForInstruction({
+            cwd: requestedCwd,
+            enabled: Boolean(options.init),
+            initializeRepository: executeInitializeRepository,
+            input: stdin,
+            inspectRepository: dependencies.inspectRepository ?? inspectRepository,
+            output: stdout,
+            requestWriteAccess: Boolean(intentDecision?.requiresWriteAccess)
+          });
+
+      if (initialization.declined && intentDecision?.requiresWriteAccess) {
+        stdout.write("Cancelled: Git repository initialization is required before DeepVibe can apply write requests here.\n");
+        return;
+      }
+
+      const bootstrapGuidance = applyBootstrapGuidance({
+        cwd: requestedCwd,
         instruction,
+        repositoryJustInitialized: initialization.initialized
+      });
+
+      if (bootstrapGuidance.notice) {
+        stdout.write(`${bootstrapGuidance.notice}\n`);
+      }
+
+      const effectiveInstruction = bootstrapGuidance.instruction;
+      const usePlanExecution =
+        Boolean(options.plan) ||
+        (!options.dryRun && !options.force && Boolean(intentDecision?.requiresWriteAccess));
+
+      if (usePlanExecution && !options.plan) {
+        stdout.write("Auto-enabled plan mode for this write request.\n");
+      }
+
+      const executionOptions = {
+        instruction: effectiveInstruction,
         cwd: requestedCwd,
         dryRun: Boolean(options.dryRun),
-        planMode: Boolean(options.plan),
+        planMode: usePlanExecution,
         profile: profile.legacyProfile,
         profileSettings: profile.profileSettings
       } as const;
 
-      if (options.plan) {
-        await maybeInitializeRepository({
-          cwd: requestedCwd,
-          enabled: Boolean(options.init),
-          initializeRepository: executeInitializeRepository,
-          inspectRepository: dependencies.inspectRepository ?? inspectRepository,
-          output: stdout
-        });
+      if (usePlanExecution) {
+        ensureInteractiveConfirmationAvailable(stdin, stdout);
         const access = await prepareWorkspace({
           cwd: requestedCwd,
           homeDir: dependencies.homeDir,
@@ -320,6 +376,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
           applyFileChanges: dependencies.applyFileChanges,
           createAiCommit: dependencies.createAiCommit,
           createClient: dependencies.createClient,
+          commandPermissions: resolveCommandPermissions(config.toolPermissions?.command),
           commandApproval:
             dependencies.commandApproval ??
             createCommandApprovalHandler({
@@ -336,7 +393,8 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
           inspectRepository: dependencies.inspectRepository,
           parseResponse: dependencies.parseResponse,
           recordOperation: dependencies.recordOperation,
-          commandRunner: accessDependencies.commandRunner
+          commandRunner: accessDependencies.commandRunner,
+          verifyWrittenChanges: executeVerifyWrittenChanges
         });
         stdout.write(`${planResult.message}\n`);
         return;
@@ -353,13 +411,6 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
             return executeRunEngine({ ...executionOptions, cwd: access.effectiveCwd }, withWorkspaceAccessDependencies(access, loadConfig({ cwd: access.effectiveCwd, homeDir: dependencies.homeDir }), dependencies));
           })()
         : await (async () => {
-            await maybeInitializeRepository({
-              cwd: requestedCwd,
-              enabled: Boolean(options.init),
-              initializeRepository: executeInitializeRepository,
-              inspectRepository: dependencies.inspectRepository ?? inspectRepository,
-              output: stdout
-            });
             const access = await prepareWorkspace({
               cwd: requestedCwd,
               homeDir: dependencies.homeDir,
@@ -396,6 +447,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
               applyFileChanges: dependencies.applyFileChanges,
               createAiCommit: dependencies.createAiCommit,
               createClient: dependencies.createClient,
+              commandPermissions: resolveCommandPermissions(config.toolPermissions?.command),
               commandApproval:
                 dependencies.commandApproval ??
                 createCommandApprovalHandler({
@@ -412,7 +464,8 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
               inspectRepository: dependencies.inspectRepository,
               parseResponse: dependencies.parseResponse,
               recordOperation: dependencies.recordOperation,
-              commandRunner: accessDependencies.commandRunner
+              commandRunner: accessDependencies.commandRunner,
+              verifyWrittenChanges: executeVerifyWrittenChanges
             });
           })();
 
@@ -631,10 +684,12 @@ function filterLandingChanges(
 interface ConfirmedExecutionDependencies extends RunEngineDependencies {
   applyPreparedExecution: typeof applyPreparedExecution;
   confirmPreparedExecution: typeof confirmPreparedExecution;
+  commandPermissions?: ReturnType<typeof resolveCommandPermissions>;
   force: boolean;
   prepareExecution: typeof prepareExecution;
   stdin: NodeJS.ReadableStream;
   stdout: NodeJS.WritableStream;
+  verifyWrittenChanges?: typeof verifyWrittenChanges;
 }
 
 async function runConfirmedExecution(
@@ -666,7 +721,7 @@ async function runConfirmedExecution(
     }
   }
 
-  return dependencies.applyPreparedExecution(options.cwd, prepared, {
+  const applyResult = await dependencies.applyPreparedExecution(options.cwd, prepared, {
     applyFileChanges: dependencies.applyFileChanges,
     createAiCommit: dependencies.createAiCommit,
     createClient: dependencies.createClient,
@@ -675,16 +730,44 @@ async function runConfirmedExecution(
     parseResponse: dependencies.parseResponse,
     recordOperation: dependencies.recordOperation
   });
+
+  const hasWrites = prepared.parsedResponse.files.length > 0 || prepared.toolMutations.length > 0;
+
+  if (!hasWrites || !dependencies.verifyWrittenChanges) {
+    return applyResult;
+  }
+
+  dependencies.stdout.write("Running verification...\n");
+
+  try {
+    const verification = await dependencies.verifyWrittenChanges({
+      abortSignal: dependencies.abortSignal,
+      commandApproval: dependencies.commandApproval,
+      commandPermissions: dependencies.commandPermissions,
+      commandRunner: dependencies.commandRunner,
+      cwd: options.cwd
+    });
+
+    return {
+      message: `${applyResult.message}\n${formatVerificationSummary(verification)}`
+    };
+  } catch (error) {
+    return {
+      message: `${applyResult.message}\nVerification failed: ${error instanceof Error ? error.message : "unknown error"}`
+    };
+  }
 }
 
 interface PlanExecutionDependencies extends RunEngineDependencies {
   applyPreparedExecution: typeof applyPreparedExecution;
+  commandPermissions?: ReturnType<typeof resolveCommandPermissions>;
   confirmPlanStep: typeof confirmPlanStep;
   emitStepEvent?: (event: { type: string; stepIndex: number; totalSteps: number; payload?: Record<string, unknown> }) => void;
   generatePlan: typeof generatePlan;
   prepareExecution: typeof prepareExecution;
   stdin: NodeJS.ReadableStream;
   stdout: NodeJS.WritableStream;
+  verifyWrittenChanges?: typeof verifyWrittenChanges;
 }
 
 async function runPlanExecution(
@@ -738,8 +821,27 @@ async function runPlanExecution(
         output: dependencies.stdout
       })
   });
+  const completedSteps = stepResults.filter((result) => result.status === "completed").length;
+  let message = formatPlanResults(stepResults);
 
-  return { message: formatPlanResults(stepResults) };
+  if (completedSteps > 0 && dependencies.verifyWrittenChanges) {
+    dependencies.stdout.write("Running verification...\n");
+
+    try {
+      const verification = await dependencies.verifyWrittenChanges({
+        abortSignal: dependencies.abortSignal,
+        commandApproval: dependencies.commandApproval,
+        commandPermissions: dependencies.commandPermissions,
+        commandRunner: dependencies.commandRunner,
+        cwd: options.cwd
+      });
+      message = `${message}\n${formatVerificationSummary(verification)}`;
+    } catch (error) {
+      message = `${message}\nVerification failed: ${error instanceof Error ? error.message : "unknown error"}`;
+    }
+  }
+
+  return { message };
 }
 
 function parsePortOption(value: string): number {
@@ -829,25 +931,53 @@ function parseReasoningEffect(value: string): ReplReasoningEffect {
   throw new Error(`Unsupported reasoning effect "${value}". Expected low, medium, high, or xhigh.`);
 }
 
-async function maybeInitializeRepository(options: {
+async function maybeInitializeRepositoryForInstruction(options: {
   cwd: string;
   enabled: boolean;
   initializeRepository: typeof initializeRepository;
+  input: NodeJS.ReadableStream;
   inspectRepository: typeof inspectRepository;
   output: NodeJS.WritableStream;
-}): Promise<void> {
-  if (!options.enabled) {
-    return;
-  }
-
+  requestWriteAccess: boolean;
+}): Promise<{ declined: boolean; initialized: boolean }> {
   const repositoryState = await options.inspectRepository(options.cwd);
 
   if (repositoryState.isRepository) {
-    return;
+    return { declined: false, initialized: false };
   }
 
-  await options.initializeRepository(options.cwd);
-  options.output.write("Git repository initialized.\n");
+  if (options.enabled) {
+    await options.initializeRepository(options.cwd);
+    options.output.write("Git repository initialized.\n");
+    return { declined: false, initialized: true };
+  }
+
+  if (!options.requestWriteAccess || !isInteractiveInput(options.input) || !isInteractiveOutput(options.output)) {
+    return { declined: false, initialized: false };
+  }
+
+  const readline = createInterface({
+    input: options.input,
+    output: options.output
+  });
+
+  try {
+    const answer = (
+      await readline.question(
+        "This directory is not a Git repository. Initialize one now so I can create and edit project files? [Y]es [N]o: "
+      )
+    ).trim().toLowerCase();
+
+    if (!(answer === "y" || answer === "yes" || answer.length === 0)) {
+      return { declined: true, initialized: false };
+    }
+
+    await options.initializeRepository(options.cwd);
+    options.output.write("Git repository initialized.\n");
+    return { declined: false, initialized: true };
+  } finally {
+    readline.close();
+  }
 }
 
 function createCommandApprovalHandler(options: {

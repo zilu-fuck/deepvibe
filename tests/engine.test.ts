@@ -5,9 +5,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildContext } from "../src/context/builder.js";
+import { REPL_SYSTEM_PROMPT } from "../src/context/prompts.js";
+import { REPL_CHAT_ONLY_SYSTEM_PROMPT } from "../src/context/repl-chat-only-prompt.js";
 import { loadContextStore } from "../src/context-store.js";
 import { ConfigError } from "../src/config.js";
 import { applyPreparedExecution, EngineError, executePlanSteps, executeReplTurn, generatePlan, runEngine } from "../src/engine.js";
+import type { ChatMessage } from "../src/llm/deepseek-client.js";
 import { resolveModelProfile } from "../src/model-profile.js";
 
 const tempDirs: string[] = [];
@@ -257,6 +260,75 @@ describe("executeReplTurn", () => {
     expect(result.parsedResponse.files).toEqual([]);
     expect(result.parsedResponse.summary).toContain("Hello from chat mode.");
     expect(result.toolCallsUsed).toBe(false);
+  });
+
+  it("refreshes stale chat-only history after entering a Git repository", async () => {
+    const cwd = createWorkspace({
+      "src/index.ts": "console.log('hello');"
+    });
+    mkdirSync(path.join(cwd, ".deepvibe"), { recursive: true });
+    writeFileSync(path.join(cwd, ".deepvibe", "config.json"), JSON.stringify({ apiKey: "test-key" }), "utf8");
+
+    let capturedMessages: ChatMessage[] | undefined;
+    const createStreamingCompletion = vi.fn().mockImplementation(async (
+      messages: ChatMessage[],
+      _options: unknown,
+      callbacks?: { onContent?: (chunk: string) => void }
+    ) => {
+      capturedMessages = messages.map((message) => ({ ...message }));
+      callbacks?.onContent?.("Ready in project mode.");
+      return {
+        id: "chat_2",
+        content: "Ready in project mode.",
+        reasoningContent: "",
+        finishReason: "stop",
+        toolCalls: [],
+        usage: null
+      };
+    });
+
+    await executeReplTurn(
+      {
+        conversationMessages: [
+          { role: "system", content: REPL_CHAT_ONLY_SYSTEM_PROMPT },
+          { role: "user", content: "User message:\ncreate a project" },
+          { role: "assistant", content: "Run git init first." }
+        ],
+        cwd,
+        instruction: "create src/app.ts",
+        profileSettings: resolveModelProfile("default")
+      },
+      {
+        createClient: () => ({
+          createCompletion: vi.fn(),
+          createStreamingCompletion
+        }),
+        createTools: () => [],
+        inspectRepository: async () => ({
+          isRepository: true,
+          isDirty: false,
+          currentHead: "abc123"
+        }),
+        loadPluginTools: async () => [],
+        scanProject: async () => ({
+          candidates: ["src/index.ts"],
+          explicitPaths: [],
+          scannedFiles: 1
+        })
+      }
+    );
+
+    expect(createStreamingCompletion).toHaveBeenCalledTimes(1);
+    expect(capturedMessages).toHaveLength(3);
+    expect(capturedMessages?.[0]).toEqual({
+      role: "system",
+      content: REPL_SYSTEM_PROMPT
+    });
+    expect(capturedMessages?.some((message) => message.role === "assistant" && message.content === "Run git init first.")).toBe(false);
+    expect(capturedMessages?.[2]).toMatchObject({
+      role: "user"
+    });
+    expect(capturedMessages?.[2]?.content).toContain("create src/app.ts");
   });
 });
 

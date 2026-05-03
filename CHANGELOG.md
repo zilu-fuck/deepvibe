@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Workflow
+- one-shot CLI now prompts for `git init` on write requests outside a repository
+- write requests default to `plan -> confirm -> execute -> verify`
+- freshly initialized empty repositories now get minimal bootstrap guidance before deeper implementation
+- REPL engineering-intent detection now uses a conversational classifier with heuristic fallback
+
+### Platform
+- added DeepSeek beta FIM completion support
+- exposed FIM completions over HTTP (`/completions/fim`) and JSON-RPC (`deepvibe.completion.fim`)
+- verification stage now detects allowed test/build commands and runs them after successful writes
+
+### Internal Refactors
+- split intent detection, bootstrap guidance, and verification into dedicated modules
+- documented plugin lifecycle hooks and the expanded CLI/REPL module surface
+
 ## v0.1.0
 
 ### Core Engine

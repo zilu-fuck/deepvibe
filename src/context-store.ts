@@ -11,6 +11,7 @@ export interface ContextStore {
 
 export interface ContextSession {
   chatHistory?: ChatMessage[];
+  displayHistory?: ChatMessage[];
   createdAt: string;
   id: string;
   turns: ContextTurn[];
@@ -204,15 +205,36 @@ export function switchSession(rootDir: string, sessionId: string): ContextStore 
 }
 
 export function updateChatHistory(rootDir: string, sessionId: string, messages: ChatMessage[]): void {
+  updateSessionMessages(rootDir, sessionId, { chatHistory: messages });
+}
+
+export function updateDisplayHistory(rootDir: string, sessionId: string, messages: ChatMessage[]): void {
+  updateSessionMessages(rootDir, sessionId, { displayHistory: messages });
+}
+
+export function loadDisplayHistory(store: ContextStore, sessionId?: string): ChatMessage[] {
+  const targetId = sessionId ?? store.currentSessionId;
+  const session = store.sessions.find((s) => s.id === targetId);
+
+  return session?.displayHistory ?? session?.chatHistory ?? [];
+}
+
+function updateSessionMessages(
+  rootDir: string,
+  sessionId: string,
+  updates: { chatHistory?: ChatMessage[]; displayHistory?: ChatMessage[] }
+): void {
   const store = loadContextStore(rootDir);
-  const trimmed = messages.length > MAX_CHAT_HISTORY_MESSAGES
-    ? messages.slice(-MAX_CHAT_HISTORY_MESSAGES)
-    : messages;
   const nextStore: ContextStore = {
     ...store,
     sessions: store.sessions.map((session) =>
       session.id === sessionId
-        ? { ...session, chatHistory: trimmed, updatedAt: new Date().toISOString() }
+        ? {
+            ...session,
+            ...(updates.chatHistory !== undefined ? { chatHistory: trimStoredMessages(updates.chatHistory) } : {}),
+            ...(updates.displayHistory !== undefined ? { displayHistory: trimStoredMessages(updates.displayHistory) } : {}),
+            updatedAt: new Date().toISOString()
+          }
         : session
     )
   };
@@ -225,6 +247,12 @@ export function loadChatHistory(store: ContextStore, sessionId?: string): ChatMe
   const session = store.sessions.find((s) => s.id === targetId);
 
   return session?.chatHistory ?? [];
+}
+
+function trimStoredMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.length > MAX_CHAT_HISTORY_MESSAGES
+    ? messages.slice(-MAX_CHAT_HISTORY_MESSAGES)
+    : messages;
 }
 
 function persistContextStore(rootDir: string, store: ContextStore): void {

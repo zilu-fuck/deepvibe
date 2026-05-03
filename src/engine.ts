@@ -14,6 +14,7 @@ import {
   type ChatMessage,
   type CreateCompletionOptions,
   type DeepSeekCompletionResult,
+  type DeepSeekFimCompletionResult,
   type DeepSeekUsage,
   type StreamingCallbacks
 } from "./llm/deepseek-client.js";
@@ -90,6 +91,9 @@ export interface RunEngineDependencies {
       messages: Parameters<DeepSeekClient["createCompletion"]>[0],
       options: CreateCompletionOptions
     ) => Promise<DeepSeekCompletionResult>;
+    createFimCompletion?: (
+      options: Parameters<DeepSeekClient["createFimCompletion"]>[0]
+    ) => Promise<DeepSeekFimCompletionResult>;
     createStreamingCompletion?: (
       messages: ChatMessage[],
       options: CreateCompletionOptions,
@@ -653,18 +657,7 @@ export async function executeReplTurn(
     : defaultClient.createStreamingCompletion.bind(defaultClient);
 
   try {
-    const conversationMessages: ChatMessage[] = [...options.conversationMessages];
-
-    if (conversationMessages.length === 0) {
-      conversationMessages.push(...context.messages);
-    } else {
-      const taskMessages = context.messages.filter((msg) => msg.role === "user");
-      const taskMessage = taskMessages[taskMessages.length - 1];
-
-      if (taskMessage) {
-        conversationMessages.push(taskMessage);
-      }
-    }
+    const conversationMessages = seedReplConversationMessages(options.conversationMessages, context.messages);
 
     const executeToolCallBatch = dependencies.executeToolCalls ?? executeToolCalls;
     let toolCallsUsed = false;
@@ -850,6 +843,27 @@ function buildStandaloneReplChatContext(options: {
     maxPromptTokens,
     truncated: false
   };
+}
+
+function seedReplConversationMessages(
+  history: ChatMessage[],
+  contextMessages: ContextMessage[]
+): ChatMessage[] {
+  if (history.length === 0) {
+    return [...contextMessages];
+  }
+
+  const currentSystemMessage = contextMessages.find((message) => message.role === "system");
+  const previousSystemMessage = history.find((message) => message.role === "system");
+
+  if (!currentSystemMessage || !previousSystemMessage || previousSystemMessage.content !== currentSystemMessage.content) {
+    return [...contextMessages];
+  }
+
+  const taskMessages = contextMessages.filter((message) => message.role === "user");
+  const taskMessage = taskMessages[taskMessages.length - 1];
+
+  return taskMessage ? [...history, taskMessage] : [...history];
 }
 
 export interface PlanResult {

@@ -57,6 +57,37 @@ describe("service server", () => {
     expect(json.result.message).toBe("run ok");
   });
 
+  it("serves the FIM completion endpoint through the injected handler", async () => {
+    const createFimCompletion = vi.fn().mockResolvedValue({
+      id: "fim_1",
+      content: "completed()",
+      finishReason: "stop",
+      logprobs: null,
+      usage: { total_tokens: 7 }
+    });
+    const service = await startService({
+      port: 0,
+      dependencies: {
+        createFimCompletion
+      }
+    });
+    runningServices.push(service);
+
+    const response = await fetch(`http://${service.host}:${service.port}/completions/fim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt: "function hello() {",
+        suffix: "}"
+      })
+    });
+    const json = (await response.json()) as { ok: boolean; result: { content: string } };
+
+    expect(response.status).toBe(200);
+    expect(createFimCompletion).toHaveBeenCalledTimes(1);
+    expect(json.result.content).toBe("completed()");
+  });
+
   it("runs the /undo endpoint through the injected undo handler", async () => {
     const undoLastAiChange = vi.fn().mockResolvedValue({
       kind: "operation",
@@ -115,6 +146,54 @@ describe("service server", () => {
       id: 1,
       result: {
         message: "rpc ok"
+      }
+    });
+  });
+
+  it("supports JSON-RPC FIM completion requests", async () => {
+    const createFimCompletion = vi.fn().mockResolvedValue({
+      id: "fim_rpc",
+      content: "return 1;",
+      finishReason: "stop",
+      logprobs: null,
+      usage: { total_tokens: 6 }
+    });
+    const service = await startService({
+      port: 0,
+      dependencies: {
+        createFimCompletion
+      }
+    });
+    runningServices.push(service);
+
+    const response = await fetch(`http://${service.host}:${service.port}/rpc`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 7,
+        method: "deepvibe.completion.fim",
+        params: {
+          prompt: "if (value) {",
+          suffix: "}"
+        }
+      })
+    });
+    const json = (await response.json()) as { jsonrpc: string; id: number; result: { content: string } };
+
+    expect(response.status).toBe(200);
+    expect(createFimCompletion).toHaveBeenCalledTimes(1);
+    expect(json).toEqual({
+      jsonrpc: "2.0",
+      id: 7,
+      result: {
+        id: "fim_rpc",
+        content: "return 1;",
+        finishReason: "stop",
+        logprobs: null,
+        usage: {
+          total_tokens: 6
+        }
       }
     });
   });

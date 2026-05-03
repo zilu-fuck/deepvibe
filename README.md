@@ -22,14 +22,20 @@ This repository currently contains the `M1` MVP foundation:
 - built-in HTTP + JSON-RPC service mode
 - task-based SSE event streaming, cancellation, and service-side concurrency isolation
 - first-pass local plugin system for tool contributions
+- plugin lifecycle hooks with isolated initialize/execute/dispose handling
 - project-level custom system prompt via `.deepvibe/prompt.md`
-- interactive REPL with streaming responses and per-turn confirmation
+- interactive REPL with chat-only/project mode switching, streaming responses, and per-turn confirmation
+- automatic `git init` guidance for REPL and one-shot write requests outside a repository
+- empty-repository bootstrap guidance for minimal project scaffolding
 - session management with persistence, switching, and history
 - multi-step plan mode with step-by-step execution
+- default write requests now flow through `plan -> confirm -> execute -> verify`
+- FIM completion support via the DeepSeek beta completions API and service endpoints
 
 Current gaps:
 
-- no richer plugin lifecycle management or resource governance beyond timeout/memory cap yet
+- the REPL still uses an evolving panel-based TUI rather than a fully fixed-pane layout
+- FIM is exposed through the client/service layer, but editor-side inline completion UX is still pending
 
 ## Requirements
 
@@ -295,13 +301,15 @@ pnpm cli "update API timeout handling"
 
 The CLI will:
 
-1. scan the project
-2. build context
-3. call the model
-4. show a change summary
-5. ask for `[A]ccept / [R]eview / [N]o`
+1. prompt to initialize `git` first when a write request starts outside a repository
+2. auto-switch write requests into plan mode unless you opt into `--force`
+3. review the generated plan before execution starts
+4. confirm each step, with optional per-file review before apply
+5. run a best-effort verification command after changes land when the workspace exposes an allowed test/build command
 
 In review mode, the CLI now shows each file diff one by one so you can apply or skip files individually before anything is written.
+
+If a brand-new repository is effectively empty and your request is to start a project, DeepVibe now nudges the execution toward a minimal starter scaffold before deeper feature work.
 
 Skip confirmation:
 
@@ -337,6 +345,7 @@ Service endpoints:
 
 - `GET /health`
 - `POST /run`
+- `POST /completions/fim`
 - `POST /undo`
 - `POST /rpc` for JSON-RPC 2.0
 - `POST /tasks/run`
@@ -421,8 +430,17 @@ Chat-only mode notes:
 
 - normal conversation works even outside a Git repository
 - file edits, patches, and repo operations stay disabled until you enter a Git repository
-- if you ask for clear project/file creation work in chat-only mode, DeepVibe can prompt to run `git init` and switch into project mode
+- if you ask for clear project/file creation work in chat-only mode, DeepVibe can classify the turn, prompt to run `git init`, and switch into project mode
 - once you open the REPL inside a Git repository, DeepVibe switches back to full project mode
+
+## FIM Completions
+
+DeepVibe now exposes Fill-in-the-Middle completions through:
+
+- HTTP: `POST /completions/fim`
+- JSON-RPC: `deepvibe.completion.fim`
+
+The FIM path uses DeepSeek's beta completions endpoint and is intended for editor or IDE integrations that want prompt/suffix-based inline completion.
 
 ## Multi-step Plan Mode
 
@@ -478,9 +496,21 @@ Key implementation files:
 - [src/engine.ts](./src/engine.ts)
 - [src/cli.ts](./src/cli.ts)
 - [src/repl.ts](./src/repl.ts)
+- [src/status.ts](./src/status.ts)
+- [src/intent.ts](./src/intent.ts)
+- [src/project-bootstrap.ts](./src/project-bootstrap.ts)
+- [src/verification.ts](./src/verification.ts)
 - [src/context-store.ts](./src/context-store.ts)
+- [src/cli-confirmation.ts](./src/cli-confirmation.ts)
+- [src/command-approval-store.ts](./src/command-approval-store.ts)
+- [src/workspace-access.ts](./src/workspace-access.ts)
+- [src/workspace-landing.ts](./src/workspace-landing.ts)
 - [src/search.ts](./src/search.ts)
 - [src/tools.ts](./src/tools.ts)
+- [src/plugins.ts](./src/plugins.ts)
+- [src/server.ts](./src/server.ts)
+- [src/task-manager.ts](./src/task-manager.ts)
+- [src/fim.ts](./src/fim.ts)
 - [src/project/scanner.ts](./src/project/scanner.ts)
 - [src/context/builder.ts](./src/context/builder.ts)
 - [src/llm/deepseek-client.ts](./src/llm/deepseek-client.ts)

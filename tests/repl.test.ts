@@ -110,7 +110,7 @@ describe("REPL", () => {
     const stdin = createInputStream("/quit\n");
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       { stdin, stdout, inspectRepository: mockInspectRepo() }
     );
 
@@ -123,13 +123,13 @@ describe("REPL", () => {
     const stdin = createInputStream("/quit\n");
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       { stdin, stdout, inspectRepository: mockInspectRepo() }
     );
 
     const output = stdout.readAsString();
     expect(output).toContain("DeepVibe Chat ready.");
-    expect(output).toContain("+-- Status");
+    expect(output).toContain("\u250c\u2500 Status");
   });
 
   it("shows the workspace mode in the status panel", async () => {
@@ -163,6 +163,7 @@ describe("REPL", () => {
       {
         cwd: rootDir,
         profile: "default",
+        lang: "en",
         requestedCwd: rootDir,
         workspaceMode: "full"
       },
@@ -170,8 +171,8 @@ describe("REPL", () => {
     );
 
     const output = stdout.readAsString();
-    expect(output).toContain("\x1B[10;24r");
-    expect(output).toContain("+-- Status");
+    expect(output).toContain("\x1B[12;20r");
+    expect(output).toContain("\u250c\u2500 Status");
   });
 
   it("redraws the status panel after /clear", async () => {
@@ -183,6 +184,7 @@ describe("REPL", () => {
       {
         cwd: rootDir,
         profile: "default",
+        lang: "en",
         requestedCwd: rootDir,
         workspaceMode: "full"
       },
@@ -191,7 +193,7 @@ describe("REPL", () => {
 
     const output = stdout.readAsString();
     expect(output).toContain("Workspace: full");
-    expect(output.match(/\+-- Status/g)?.length).toBe(2);
+    expect(output.match(/\u250c\u2500 Status/g)?.length).toBe(2);
   });
 
   it("refreshes the pinned status panel when the active session changes", async () => {
@@ -203,6 +205,7 @@ describe("REPL", () => {
       {
         cwd: rootDir,
         profile: "default",
+        lang: "en",
         requestedCwd: rootDir,
         workspaceMode: "full"
       },
@@ -212,7 +215,7 @@ describe("REPL", () => {
     const output = stdout.readAsString();
     expect(output).toContain("Started new session");
     expect(output.match(/\x1B7/g)?.length).toBeGreaterThanOrEqual(1);
-    expect(output.match(/\+-- Status/g)?.length).toBe(2);
+    expect(output.match(/\u250c\u2500 Status/g)?.length).toBe(2);
   });
 
   it("shows chat-only mode when no Git repository is detected", async () => {
@@ -221,7 +224,7 @@ describe("REPL", () => {
     const stdin = createInputStream("/quit\n");
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
@@ -239,8 +242,7 @@ describe("REPL", () => {
   it("offers git init when engineering intent is detected in chat-only mode", async () => {
     const rootDir = createWorkspace({});
     const stdout = createWritableStream();
-    const stdin = new PassThrough() as PassThrough & NodeJS.ReadableStream & { isTTY?: boolean };
-    stdin.isTTY = true;
+    const stdin = new PassThrough() as PassThrough & NodeJS.ReadableStream;
 
     setImmediate(() => {
       stdin.write("implement a new api\n", "utf8");
@@ -250,7 +252,7 @@ describe("REPL", () => {
       setTimeout(() => {
         stdin.write("/quit\n", "utf8");
         stdin.end();
-      }, 500);
+      }, 400);
     });
     let repoInitialized = false;
     const executeTurn = vi.fn().mockResolvedValue(createChatOnlyReplResult("Implemented."));
@@ -280,7 +282,7 @@ describe("REPL", () => {
     const output = stdout.readAsString();
     expect(output).toContain("╭─ You");
     expect(output).toContain("Initialize one now");
-    expect(output).toContain("+-- Workspace");
+    expect(output).toContain("\u250c\u2500 Workspace");
     expect(output).toContain("Switched to project mode");
     expect(executeTurn).toHaveBeenCalledTimes(1);
   });
@@ -299,13 +301,13 @@ describe("REPL", () => {
       setTimeout(() => {
         stdin.write("/quit\n", "utf8");
         stdin.end();
-      }, 500);
+      }, 400);
     });
     const executeTurn = vi.fn().mockResolvedValue(createChatOnlyReplResult("I can help plan it once you enter a repository."));
     const initializeRepository = vi.fn();
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
@@ -321,7 +323,7 @@ describe("REPL", () => {
 
     const output = stdout.readAsString();
     expect(initializeRepository).not.toHaveBeenCalled();
-    expect(output).toContain("+-- Workspace");
+    expect(output).toContain("\u250c\u2500 Workspace");
     expect(output).toContain("Continuing in chat-only mode");
     expect(executeTurn).toHaveBeenCalledTimes(1);
   });
@@ -332,12 +334,12 @@ describe("REPL", () => {
     const stdin = createInputStream("/help\n/quit\n");
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       { stdin, stdout, inspectRepository: mockInspectRepo() }
     );
 
     const output = stdout.readAsString();
-    expect(output).toContain("+-- Commands");
+    expect(output).toContain("\u250c\u2500 Commands");
     expect(output).toContain("/effect [mode]");
     expect(output).toContain("/model [name]");
     expect(output).toContain("/cost");
@@ -372,12 +374,12 @@ describe("REPL", () => {
     const mockTurn = vi.fn().mockResolvedValue(createChatOnlyReplResult("Done."));
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
         executeReplTurn: mockTurn,
-        inspectRepository: mockInspectRepo()
+        inspectRepository: mockInspectRepo(true)
       }
     );
 
@@ -451,12 +453,12 @@ describe("REPL", () => {
     const mockTurn = vi.fn().mockResolvedValue(createChatOnlyReplResult("Done."));
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
         executeReplTurn: mockTurn,
-        inspectRepository: mockInspectRepo()
+        inspectRepository: mockInspectRepo(true)
       }
     );
 
@@ -513,12 +515,12 @@ describe("REPL", () => {
     const mockTurn = vi.fn().mockResolvedValue(createChatOnlyReplResult("Done."));
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
         executeReplTurn: mockTurn,
-        inspectRepository: mockInspectRepo()
+        inspectRepository: mockInspectRepo(true)
       }
     );
 
@@ -568,18 +570,18 @@ describe("REPL", () => {
     });
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
         executeReplTurn: mockTurn,
-        inspectRepository: mockInspectRepo()
+        inspectRepository: mockInspectRepo(true)
       }
     );
 
     const output = stdout.readAsString();
     expect(output).toContain("[Usage] prompt=100 completion=40 total=140");
-    expect(output).toContain("+-- Usage");
+    expect(output).toContain("\u250c\u2500 Usage");
     expect(output).toContain("Session Total: prompt=100, completion=40, total=140");
   });
 
@@ -635,9 +637,7 @@ describe("REPL", () => {
     const mockTurn = vi.fn().mockResolvedValue(createChatOnlyReplResult("Done."));
 
     setImmediate(() => {
-      stdin.write("line 1\n", "utf8");
-      stdin.write("line 2\n", "utf8");
-      stdin.write("line 3\n", "utf8");
+      stdin.write("line 1\nline 2\nline 3\n", "utf8");
       setTimeout(() => {
         stdin.write("/quit\n", "utf8");
         stdin.end();
@@ -645,12 +645,12 @@ describe("REPL", () => {
     });
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
         executeReplTurn: mockTurn,
-        inspectRepository: mockInspectRepo()
+        inspectRepository: mockInspectRepo(true)
       }
     );
 
@@ -742,6 +742,70 @@ describe("REPL", () => {
     );
 
     expect(stdout.readAsString()).toContain("No conversation history");
+  });
+
+  it("shows the full visible transcript in /history even when prompt history is empty", async () => {
+    const rootDir = createWorkspace({});
+    const stdout = createWritableStream();
+    const stdin = createInputStream("do something\n/history\n\n/quit\n");
+
+    const mockTurn = vi.fn().mockImplementation(async (_opts: unknown, _deps: unknown, callbacks?: { onContent?: (chunk: string) => void }) => {
+      callbacks?.onContent?.("Visible answer.");
+      return createChatOnlyReplResult("Visible answer.");
+    });
+
+    await startRepl(
+      { cwd: rootDir, profile: "default", lang: "en" },
+      {
+        stdin,
+        stdout,
+        executeReplTurn: mockTurn,
+        inspectRepository: mockInspectRepo()
+      }
+    );
+
+    const output = stdout.readAsString();
+    expect(output).toContain("Conversation History");
+    expect(output).toContain("do something");
+    expect(output).toContain("Visible answer.");
+  });
+
+  it("supports mouse wheel scrolling in /history without leaking click sequences", async () => {
+    const rootDir = createWorkspace({});
+    const stdout = createWritableStream();
+    const stdin = createTtyInputStream([
+      "do something\n",
+      "/history\n",
+      "\x1B[<0;77;5M",
+      "\x1B[<65;10;5M",
+      "\r",
+      "/quit\n"
+    ]);
+    const longAnswer = Array.from({ length: 40 }, (_, index) => `visible answer line ${index + 1}`).join("\n");
+
+    const mockTurn = vi.fn().mockImplementation(async (_opts: unknown, _deps: unknown, callbacks?: { onContent?: (chunk: string) => void }) => {
+      callbacks?.onContent?.(longAnswer);
+      return createChatOnlyReplResult(longAnswer);
+    });
+
+    await startRepl(
+      { cwd: rootDir, profile: "default", lang: "en" },
+      {
+        stdin,
+        stdout,
+        executeReplTurn: mockTurn,
+        inspectRepository: mockInspectRepo(true)
+      }
+    );
+
+    const output = stdout.readAsString();
+    expect(output).toContain("Conversation History");
+    expect(output).toContain("\x1B[?1000h");
+    expect(output).toContain("\x1B[?1006h");
+    expect(output).toContain("1-21/");
+    expect(output).toContain("4-24/");
+    expect(output).toMatch(/visible answer line 1 +[#.]/);
+    expect(output).not.toContain("0;77;5M");
   });
 
   it("reports unknown commands", async () => {
@@ -896,6 +960,44 @@ describe("REPL", () => {
     expect(output).toContain("Another reasoning trace.");
   });
 
+  it("supports mouse wheel scrolling in /thoughts without leaking click sequences", async () => {
+    const rootDir = createWorkspace({});
+    const stdout = createWritableStream();
+    const stdin = createTtyInputStream([
+      "do something\n",
+      "/thoughts\n",
+      "\x1B[<0;77;5M",
+      "\x1B[<65;10;5M",
+      "\r",
+      "/quit\n"
+    ]);
+    const longTrace = Array.from({ length: 40 }, (_, index) => `reasoning line ${index + 1}`).join("\n");
+
+    const mockTurn = vi.fn().mockImplementation(async (_opts: unknown, _deps: unknown, callbacks?: { onContent?: (chunk: string) => void; onReasoningContent?: (chunk: string) => void }) => {
+      callbacks?.onReasoningContent?.(longTrace);
+      callbacks?.onContent?.("Visible answer.");
+      return createChatOnlyReplResult("Visible answer.");
+    });
+
+    await startRepl(
+      { cwd: rootDir, profile: "default" },
+      {
+        stdin,
+        stdout,
+        executeReplTurn: mockTurn,
+        inspectRepository: mockInspectRepo(true)
+      }
+    );
+
+    const output = stdout.readAsString();
+    expect(output).toContain("\x1B[?1000h");
+    expect(output).toContain("\x1B[?1006h");
+    expect(output).toContain("1-21/40");
+    expect(output).toContain("4-24/40");
+    expect(output).toMatch(/reasoning line 1 +[#.]/);
+    expect(output).not.toContain("0;77;5M");
+  });
+
   it("continues after turn error", async () => {
     const rootDir = createWorkspace({});
     const stdout = createWritableStream();
@@ -943,17 +1045,20 @@ describe("REPL", () => {
     });
 
     await startRepl(
-      { cwd: rootDir, profile: "default" },
+      { cwd: rootDir, profile: "default", lang: "en" },
       {
         stdin,
         stdout,
         stderr,
-        executeReplTurn: mockTurn
+        executeReplTurn: mockTurn,
+        inspectRepository: mockInspectRepo(true)
       }
     );
 
-    expect(stderr.readAsString()).toContain("Error: API error");
-    expect(stdout.readAsString()).toContain("+-- Commands");
+    const output = stdout.readAsString();
+    expect(output).toContain("Error: API error");
+    expect(output).toContain("\u250c\u2500 Commands");
+    expect(stderr.readAsString()).toBe("");
     expect(mockTurn).toHaveBeenCalledTimes(1);
   });
 
@@ -1018,10 +1123,10 @@ describe("confirmReplExecution", () => {
     const input = createInputStream("a\n");
     const output = createWritableStream();
 
-    const confirmed = await confirmReplExecution(result, { input, output });
+    const confirmed = await confirmReplExecution(result, { input, output, lang: "en" });
 
     expect(confirmed).toBe(true);
-    expect(output.readAsString()).toContain("+-- Proposed Changes");
+    expect(output.readAsString()).toContain("\u250c\u2500 Proposed Changes");
   });
 
   it("rejects with 'n'", async () => {
@@ -1345,8 +1450,7 @@ function createWorkspace(files: Record<string, string>): string {
 }
 
 function createInputStream(contents: string, lineDelayMs = 40): NodeJS.ReadableStream {
-  const stream = new PassThrough() as PassThrough & NodeJS.ReadableStream & { isTTY?: boolean };
-  stream.isTTY = true;
+  const stream = new PassThrough() as PassThrough & NodeJS.ReadableStream;
 
   const lines = contents.split("\n");
   let i = 0;
@@ -1356,6 +1460,31 @@ function createInputStream(contents: string, lineDelayMs = 40): NodeJS.ReadableS
       stream.write(`${lines[i]}\n`, "utf8");
       i++;
       setTimeout(writeNext, lineDelayMs);
+    } else {
+      stream.end();
+    }
+  };
+
+  setImmediate(writeNext);
+
+  return stream;
+}
+
+function createTtyInputStream(chunks: string[], delayMs = 40): NodeJS.ReadableStream {
+  const stream = new PassThrough() as PassThrough & NodeJS.ReadableStream & {
+    isTTY?: boolean;
+    setRawMode?: (mode: boolean) => void;
+  };
+  stream.isTTY = true;
+  stream.setRawMode = () => undefined;
+
+  let index = 0;
+
+  const writeNext = () => {
+    if (index < chunks.length) {
+      stream.write(chunks[index]!, "utf8");
+      index += 1;
+      setTimeout(writeNext, delayMs);
     } else {
       stream.end();
     }
